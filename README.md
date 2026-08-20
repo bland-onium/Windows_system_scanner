@@ -19,5 +19,6 @@ List of installed programs (Now it scans all programs, connected to registry | �
 - [ ] Сортировка сканируемых программ
 - [ ] Поиск программ по определённым названиям и параметрам
 - [ ] Глубокий поиск лицензий на ПО
+- [ ] Вшитый MAS, который не надо будет скачивать
 
 A lot of time ago it were planned as windows and office activator which will be used by user but at once i understood that this is not enough and now there is multifunctional script which scans system, creates logs and installs licenses on Windows and Office
