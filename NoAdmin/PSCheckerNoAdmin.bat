@@ -1,22 +1,6 @@
 @echo off
 setlocal EnableExtensions EnableDelayedExpansion
 
-:: 1. Check for admin rules
-net session >nul 2>&1
-if %errorlevel% == 0 (
-    goto :AdminStart
-) else (
-    echo [!] No admin rights. Requesting UAC elevation...
-    powershell -NoProfile -ExecutionPolicy Bypass -Command "Start-Process -FilePath '%~f0' -Verb RunAs; exit $LASTEXITCODE"
-    if %errorlevel% neq 0 (
-        echo [!] Failed to elevate. exiting.
-        pause
-        exit /b 1
-    )
-    exit /b
-)
-
-:AdminStart
 :: 2. cd to folder with running code
 cd /d "%~dp0"
 
