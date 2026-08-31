@@ -12,9 +12,7 @@
 $silent = $True
 #$silent = $False
 
-
-
-$Job = Start-Job -ScriptBlock {
+#$Job = Start-Job -ScriptBlock {
     # === Logging ===
     function Write-Log {
         # Usage: Write-Log "your-text" "Good"
@@ -265,54 +263,53 @@ $Job = Start-Job -ScriptBlock {
 
     function PeripheralGet 
     {
-            param (
-                [switch]$On
-            )
-            $Classes = @{
-                "Keyboard" = "Keyboard"
-                "Mouse" = "Mouse"
-                "AUDIO" = "Volume"
-                "Printer" = "PNPPrinters"
-            }
-            foreach ($Target in $Classes.Keys) {
-                Write-Log "[$Target]:" 
-                $Devices = Get-PnpDevice -Class $Classes[$Target] -Status OK -ErrorAction SilentlyContinue
-                if ($Devices) {
-                    $Devices | Format-Table FriendlyName, InstanceId -AutoSize
-                } else {
-                    Write-Log "  Подключенные устройства не найдены" -ForegroundColor Gray
-                }
-            }   
-
-            # 3. ПОЛУЧЕНИЕ ДАННЫХ О ФЛЕШКАХ И СЪЕМНЫХ НОСИТЕЛЯХ
-            Write-Log "`n=== REMOVABLE DISKS ===" "Cyan"
-
-            # Вариант 1: Логические диски (буква, файловая система, объем)
-            Write-Log "Logical USB-disks" 
-            $UsbDrives = Get-WmiObject -Class Win32_Volume | Where-Object { $_.DriveType -eq 2 } # 2 = Съемный диск
-            if ($UsbDrives) {
-                $logical = foreach ($Drive in $UsbDrives) {
-                    New-Object PSObject -Property @{
-                        "Disk letter" = $Drive.DriveLetter
-                        "Tome"        = $Drive.Label
-                        "Filesystem"  = $Drive.FileSystem
-                        "Free (GB)"   = [Math]::Round($Drive.FreeSpace / 1GB, 2)
-                        "All (GB)"    = [Math]::Round($Drive.Capacity / 1GB, 2)
-                    } 
-                }
-                $Logical | Format-Table -AutoSize | Out-Host
+        param (
+            [switch]$On
+        )
+        $Classes = @{
+            "Keyboard" = "Keyboard"
+            "Mouse" = "Mouse"
+            "AUDIO" = "Volume"
+            "Printer" = "PNPPrinters"
+        }
+        foreach ($Target in $Classes.Keys) {
+            Write-Log "[$Target]:" 
+            $Devices = Get-PnpDevice -Class $Classes[$Target] -Status OK -ErrorAction SilentlyContinue
+            if ($Devices) {
+                $Devices | Format-Table FriendlyName, InstanceId -AutoSize
             } else {
-                Write-Log "Active flash volumes not found" -ForegroundColor Gray
+                Write-Log "  Подключенные устройства не найдены" -ForegroundColor Gray
             }
+        }   
 
-            # Вариант 2 - Физические USB-накопители
-            Write-Log "Physical USB-Drives" "Warning"
-            $UsbDiskDrives = Get-WmiObject -Class Win32_DiskDrive | Where-Object { $_.InterfaceType -eq "USB" }
-            if ($UsbDiskDrives) {
-                $UsbDiskDrives | Format-Table Model, Size, DeviceID -AutoSize
-            } else {
-                Write-Host "Physical USB-Disks not found" -ForegroundColor Gray
+        # 3. ПОЛУЧЕНИЕ ДАННЫХ О ФЛЕШКАХ И СЪЕМНЫХ НОСИТЕЛЯХ
+        Write-Log "`n=== REMOVABLE DISKS ===" "Cyan"
+        # Вариант 1: Логические диски (буква, файловая система, объем)
+        Write-Log "Logical USB-disks" 
+        $UsbDrives = Get-WmiObject -Class Win32_Volume | Where-Object { $_.DriveType -eq 2 } # 2 = Съемный диск
+        if ($UsbDrives) {
+            $logical = foreach ($Drive in $UsbDrives) {
+            New-Object PSObject -Property @{
+                "Disk letter" = $Drive.DriveLetter
+                "Tome"        = $Drive.Label
+                "Filesystem"  = $Drive.FileSystem
+                "Free (GB)"   = [Math]::Round($Drive.FreeSpace / 1GB, 2)
+                "All (GB)"    = [Math]::Round($Drive.Capacity / 1GB, 2)
+                } 
             }
+            $Logical | Format-Table -AutoSize | Out-Host
+        } else {
+            Write-Log "Active flash volumes not found" -ForegroundColor Gray
+        }
+
+        # Вариант 2 - Физические USB-накопители
+        Write-Log "Physical USB-Drives" "Warning"
+        $UsbDiskDrives = Get-WmiObject -Class Win32_DiskDrive | Where-Object { $_.InterfaceType -eq "USB" }
+        if ($UsbDiskDrives) {
+            $UsbDiskDrives | Format-Table Model, Size, DeviceID -AutoSize
+        } else {
+            Write-Host "Physical USB-Disks not found" -ForegroundColor Gray
+        }
     }
 
 
@@ -329,19 +326,17 @@ $Job = Start-Job -ScriptBlock {
 
         # It calls all the objects which has any name
         $Result = Get-ItemProperty $RegPaths -ErrorAction SilentlyContinue |
-            Where-Object { $_.DisplayName } |
-            ForEach-Object {
-                $Name = $_.DisplayName
-
-                $IsMatch = $true
-
+        Where-Object { $_.DisplayName } |
+        ForEach-Object {
+            $Name = $_.DisplayName
+            $IsMatch = $true
                 # Uncomment me if you want to seek by list
     #            $IsMatch = $false
     #            foreach ($Target in $Targets) {
     #                if ($Name -like "*$Target*") { $IsMatch = $true; break }
     #            }
 
-                if ($IsMatch) {
+            if ($IsMatch) {
                     # RawDate - buffer
                     $RawDate = $_.InstallDate
                     # CleanDate - date of latest update
@@ -371,6 +366,19 @@ $Job = Start-Job -ScriptBlock {
                 }
             }
         $Result | Format-Table -AutoSize | Out-String -Width 4096
+    }
+
+    # Функция, запрашивающая лицензию Винды
+    function Get-WindowsLicense {
+        # Use Get-WmiObject for PS 2.0 compatibility
+        $licenses = Get-WmiObject -Class SoftwareLicensingProduct -Filter "PartialProductKey is not null"
+        # Parsing all licenses to find Windows lic
+        foreach ($lic in $licenses) {
+            if ($lic.Description -like "*Windows*" -or $lic.Name -like "*Windows*") {
+                return $lic
+            }
+        }
+        return $null
     }
 
     # Функция проверки и в крайнем случае установки лицензий на офис и винду
@@ -452,6 +460,7 @@ $Job = Start-Job -ScriptBlock {
                 Where-Object { $_.Name -match 'ViPNet|Infotecs' -or $_.Command -match 'ViPNet|Infotecs' } |
                 Select-Object Name, Command, Location, User | Format-List
 
+            <#
             # Seek ViPNeT in TCP connections
             # 1. Собираем ID всех процессов, чьи имена содержат нужные ключевые слова
             $ProcessIds = Get-Process -ErrorAction SilentlyContinue | 
@@ -512,6 +521,7 @@ $Job = Start-Job -ScriptBlock {
                     }
                 }
             } | Format-List
+            #>
 
             Get-ChildItem Cert:\LocalMachine\My, Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
                 Where-Object {
@@ -523,7 +533,7 @@ $Job = Start-Job -ScriptBlock {
                             NotBefore, NotAfter, HasPrivateKey, SerialNumber | Format-List
 
             certutil -csplist
-        }
+    }
 
     # ================================================================================
     # ================================================================================
@@ -688,26 +698,39 @@ $Job = Start-Job -ScriptBlock {
 
     # 3. Check if it is NOT a removable drive (DriveType 2)
     if ($DriveInfo.DriveType -ne 2) {
-        Write-Log "Скрипт запущен не с флешки. Запускаю самоудаление..." "Warning"
+        Write-Log "Script started not from usb drive. Deleting..." "Warning"
         
         $ScriptPath = $MyInvocation.MyCommand.Path
         
         # Remove files
-        Remove-Item -Path (Join-Path $PSScriptRoot "PSChecker.bat") -Force -ErrorAction SilentlyContinue
-        Remove-Item -Path (Join-Path $PSScriptRoot "PSChecker.ps1") -Force -ErrorAction SilentlyContinue
+        #Remove-Item -Path (Join-Path $PSScriptRoot "PSChecker.bat") -Force -ErrorAction SilentlyContinue
+        #Remove-Item -Path (Join-Path $PSScriptRoot "PSChecker.ps1") -Force -ErrorAction SilentlyContinue
     } else {
-        Write-Log "Обнаружен запуск с флешки ($ScriptDriveLetter)." "Good"
+        Write-Log "Started from USB Flash ($ScriptDriveLetter)." "Good"
     }
 
     Write-Log "`n=== Script completed ==="
     Stop-Transcript
-}
+    exit
+#}
 
+<#>
+# Замените ваш блок вызова на этот тестовый:
 if ($silent){
     $Job = Start-Job -ScriptBlock $ScriptBlock
     $Job | Wait-Job | Out-Null
     $Job | Remove-Job
     Exit
 } else {
-    Invoke-Command -ScriptBlock $ScriptBlock
+    try {
+        Invoke-Command -ScriptBlock $ScriptBlock -ErrorAction Stop
+    } catch {
+        #Write-Host "--- ERROR DATA ---" -ForegroundColor Red
+        #Write-Host "Где именно упало: " $_.InvocationInfo.ScriptName
+        #Write-Host "Какая команда вызвала: " $_.InvocationInfo.MyCommand
+        #Write-Host "Полный текст ошибки: " $_.Exception.Message
+        #Write-Host "Стек вызовов:"
+        #$_.ScriptStackTrace
+    }
 }
+#>
