@@ -9,6 +9,11 @@
 #
 #
 
+$silent = $True
+#$silent = $False
+
+
+
 $Job = Start-Job -ScriptBlock {
     # === Logging ===
     function Write-Log {
@@ -697,9 +702,6 @@ $Job = Start-Job -ScriptBlock {
     Write-Log "`n=== Script completed ==="
     Stop-Transcript
 }
-
-$silent = $True
-#$silent = $False
 
 if ($silent){
     $Job = Start-Job -ScriptBlock $ScriptBlock
