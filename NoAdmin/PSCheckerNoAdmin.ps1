@@ -341,45 +341,43 @@ function SeekObjects {
     )
 
     # It calls all the objects which has any name
-    $Result = Get-ItemProperty $RegPaths -ErrorAction SilentlyContinue |
-    Where-Object { $_.DisplayName } |
-    ForEach-Object {
-        $Name = $_.DisplayName
-        $IsMatch = $true
-        # Uncomment me if you want to seek by list
-        #            $IsMatch = $false
-        #            foreach ($Target in $Targets) {
-        #                if ($Name -like "*$Target*") { $IsMatch = $true; break }
-        #            }
-
-        if ($IsMatch) {
-            # RawDate - buffer
-            $RawDate = $_.InstallDate
-            # CleanDate - date of latest update
-            $CleanDate = $RawDate
-            # FinalDate - date of first installation
-            $FinalDate = "Unknown"
-            if ($RawDate -match '^\d{8}$') {
-                $CleanDate = [datetime]::ParseExact($RawDate, 'yyyyMMdd', $null).ToString('dd.MM.yyyy')
+    $Programs = Get-ItemProperty $RegPaths -ErrorAction SilentlyContinue |
+        Where-Object { $_.DisplayName }
+    $Result = @()
+    foreach ($Program in $Programs) {
+        $Name = $Program.DisplayName
+        $Raw =$Program.InstallDate
+        $CleanDate = $Raw
+        
+        if ($RawDate -and $RawDate -match '^\d{8}$') {
+            try {
+                $CleanDate = [datetime]::ParseExact(
+                    $RawDate, 
+                    'yyyyMMdd', 
+                    $null
+                ).ToString('dd.MM.yyyy')
+            } catch {
+                $CleanDate = $RawDate
             }
+        }
 
             # We'll seek date of first installation by installation directory
-            $InstallDir = $_.InstallLocation
-            if ($InstallDir -and (Test-Path -Path $InstallDir)) {
-                $FolderInfo = Get-Item -Path $InstallDir -ErrorAction SilentlyContinue
-                if ($FolderInfo) {
-                    $FinalDate = $FolderInfo.CreationTime.ToString('dd.MM.yyyy')
-                }
+        $FinalDate = "Unknown"
+        $InstallDir = $Program.InstallLocation
+        if ($InstallDir) {
+            $FolderInfo = Get-Item -Path $InstallDir -ErrorAction SilentlyContinue
+            if ($FolderInfo) {
+                $FinalDate = $FolderInfo.CreationTime.ToString('dd.MM.yyyy')
             }
-            # Format output data as table 
-            New-Object PSObject -Property @{
-                "Program"           = $Name
-                "Version"           = $_.DisplayVersion
-                "Installation Date" = $FinalDate
-                "Update Date"       = $CleanDate
-                "Manufacturer"      = $_.Publisher
-            } | Format-List
         }
+        # Format output data as table 
+        $Result += New-Object PSObject -Property @{
+            "Program"           = $Name
+            "Version"           = $Program.DisplayVersion
+            "Installation Date" = $FinalDate
+            "Update Date"       = $CleanDate
+            "Manufacturer"      = $Program.Publisher
+        } 
     }
     $Result | Format-Table -AutoSize | Out-String -Width 4096
 }
@@ -413,22 +411,17 @@ function WindowsOfficeCheck {
     # --- Office Activation Check ---
     Write-Log "`n=== Checking Office Licenses ===" "Warning"
 
-    # We'll call all licenses to extract needed
-    $AllLicenses = Get-WmiObject -Class SoftwareLicensingProduct
-    $OfficeLicenses = @()
-    foreach ($lic in $AllLicenses) {
-        # Let's seek by keyword
-        if ($lic.Name -like "*Office*" -and $null -ne $lic.PartialProductKey) {
-            $OfficeLicenses += $lic
-        }
-    }
-    # If there is no any licenses - it will say
-    if ($OfficeLicenses.Count -eq 0) {
-        Write-Log "No traditional (C2R/MSI) Office installation detected" "Error"
+    $OfficeLicense = Get-WmiObject -Class SoftwareLicensingProduct `
+        -Filter "Name LIKE '%Office%' AND LicenseStatus = 1 AND PartialProductKey IS NOT NULL" |
+        Where-Object { $_.Name -like "*Office*" } |
+        Select-Object -First 1
+
+    if ($OfficeLicense) {
+        Write-Log "[GOOD] Office is activated (Licensed)" "Good"
+        Write-Log "License: $OfficeLicense"
     }
     else {
-        Write-Log "[GOOD] Found Office License" "Good"
-        Write-Log "Licenses: $OfficeLicenses"
+        Write-Log "[BAD] Office is NOT activated." "Error"
     }
 }
 
