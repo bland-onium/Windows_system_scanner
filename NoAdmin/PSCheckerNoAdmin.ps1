@@ -343,7 +343,8 @@ function SeekObjects {
     # It calls all the objects which has any name
     $Programs = Get-ItemProperty $RegPaths -ErrorAction SilentlyContinue |
         Where-Object { $_.DisplayName }
-    $Result = @()
+    $Result = New-Object System.Collections.ArrayList
+    
     foreach ($Program in $Programs) {
         $Name = $Program.DisplayName
         $Raw =$Program.InstallDate
@@ -428,22 +429,106 @@ function WindowsOfficeCheck {
 function ViPNeTSeek {
     Write-Log "=== VIPNET SEEKING MODULE STARTED" "Cyan"
     # Lets check for vipnet at common programms
-    Write-Log "Seeking for ViPNeT in product list"
-    Get-WmiObject -Class Win32_Product |
-    Where-Object { $_.Name -match 'ViPNet|Infotecs' } |
-    Select-Object Name, Version, Vendor, InstallDate, InstallLocation | Format-List
-
+    
+    $Pattern = 'ViPNet|Infotecs'
+    $ProcessPattern = 'ViPNet|Infotecs|Coordinator|Monitor'
+    
     # Seek in registry
     Write-Log "Seeking for ViPNeT in registry"
-    Get-ItemProperty `
-        HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*, `
-        HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*, `
-        HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
-    Where-Object { $_.DisplayName -match 'ViPNet|Infotecs' } |
-    Select-Object DisplayName, DisplayVersion, Publisher, InstallDate,
-    InstallLocation, UninstallString, QuietUninstallString | Format-List
-            
+    $UninstallPaths = @(
+        'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
+        'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
+    )
+    foreach ($Path in $UninstallPaths) {
+        Get-ItemProperty $Path -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.DisplayName -and
+                $_.DisplayName -match $Pattern
+            } |
+            Select-Object DisplayName,
+                DisplayVersion,
+                Publisher,
+                InstallDate,
+                InstallLocation,
+                UninstallString,
+                QuietUninstallString |
+            Format-List
+    }
+
+    # Seek ViPNeT in services (в службах)
+    Write-Log "Seeking for ViPNet in services"
+    
+    Get-WmiObject -Class Win32_Service `
+        -Filter "Name LIKE '%ViPNet%' OR Name LIKE '%Infotecs%'
+        -ErrorAction SilentlyContinue |
+        SelectObject Name,
+                     DisplayName,
+                     State,
+                     StartMode,
+                     StartName,
+                     PathName |
+        Format-List
+
+    # Seek ViPNeT in processes
+    Write-Log "Seeking for ViPNet in processes"
+
+    $VipnetProc = @(
+        Get-Process -ErrorAction SilentlyContinue |
+            Where-Object { 
+                $_.Name -match $ProcessPattern
+            } 
+    }
+    if ($VipnetProcesses.Count -gt 0) {
+        $VipnetProcesses |
+            Select-Object Name,
+                          Id,
+                          Path,
+                          Company,
+                          ProductVersion,
+                          StartTime |
+            Format-List
+    }
+
+    # Network
+    if ($VipnetProcesses.Count -gt 0) {
+        Write-Log "Seeking for ViPNet TCP/UDP connections"
+        # Hashtable значительно быстрее, чем
+        # $ProcessIds -contains $Pid при большом количестве соединений.
+        $ProcessIdMap = @{}
+        foreach ($Process in $VipnetProcesses) {
+            $ProcessIdMap[[int]$Process.Id] = $true
+        }
+        netstat -ano 2>$null |
+            ForEach-Object {
+                $Line = $_.Trim()
+                if ($Line -match '^(TCP|UDP)\s+(\S+)\s+(\S+)(?:\s+(\S+))?\s+(\d+)$') {
+                    $Protocol       = $Matches[1]
+                    $LocalAddress   = $Matches[2]
+                    $ForeignAddress = $Matches[3]
+                    $State          = $Matches[4]
+                    $PidFound       = [int]$Matches[5]
+                    if ($ProcessIdMap.ContainsKey($PidFound)) {
+                        New-Object PSObject -Property @{
+                            Protocol       = $Protocol
+                            LocalAddress   = $LocalAddress
+                            ForeignAddress = $ForeignAddress
+                            State          = if ($Protocol -eq 'UDP') {
+                                'N/A'
+                            }
+                            else {
+                                $State
+                            }
+                            OwningProcess  = $PidFound
+                        }
+                    }
+                }
+            } |
+            Format-List
+    }
+
     # Seek in file system
+    Write-Log "Seeking for ViPNet in file system"
     $Roots = @(
         "$env:ProgramFiles",
         "${env:ProgramFiles(x86)}",
@@ -451,96 +536,74 @@ function ViPNeTSeek {
         "$env:LOCALAPPDATA",
         "$env:APPDATA"
     ) | Where-Object { $_ -and (Test-Path $_) }
+    $Roots = $Roots | Where-Object {
+        $_ -and (Test-Path $_ -ErrorAction SilentlyContinue)
+    } | Select-Object -Unique
 
-    Get-ChildItem $Roots -Directory -Recurse -ErrorAction SilentlyContinue |
-    Where-Object { $_.FullName -match 'ViPNet|Infotecs' } |
-    Select-Object FullName, CreationTime, LastWriteTime | Format-List
-
-    # Seek ViPNeT in processes
-    Get-Process -ErrorAction SilentlyContinue |
-    Where-Object { $_.Name -match 'ViPNet|Infotecs|Coordinator|Monitor|Client' } |
-    Select-Object Name, Id, Path, Company, ProductVersion, StartTime | Format-List
-
-    # Seek ViPNeT in services (в службах)
-    Get-WmiObject -Class Win32_Service |
-    Where-Object { $_.Name -match 'ViPNet|Infotecs' -or $_.DisplayName -match 'ViPNet|Infotecs' } |
-    Select-Object Name, DisplayName, State, StartMode, StartName, PathName | Format-List
-
-    # Seek ViPNeT at startup commands (поиск в автозапуске)
-    Get-WmiObject -Class Win32_StartupCommand |
-    Where-Object { $_.Name -match 'ViPNet|Infotecs' -or $_.Command -match 'ViPNet|Infotecs' } |
-    Select-Object Name, Command, Location, User | Format-List
-    # Seek ViPNeT in TCP connections
-    # 1. Собираем ID всех процессов, чьи имена содержат нужные ключевые слова
-    $ProcessIds = Get-Process -ErrorAction SilentlyContinue | 
-    Where-Object { $_.Name -match 'ViPNet|Infotecs|Coordinator|Monitor|Client' } | 
-    Select-Object -ExpandProperty Id
-
-    # Проверяем, нашли ли мы процессы, чтобы не запускать netstat вхолостую
-    if ($ProcessIds) {
-        # 2. Вызываем netstat -ano (флаг -o выводит PID в конце каждой строки)
-        netstat -ano | ForEach-Object {
-            $Line = $_.Trim()
-            # Регулярным выражением забираем PID (это цифры в самом конце строки)
-            if ($Line -match '(?<PID>\d+)$') {
-                $PidFound = [int]$Matches['PID']
-                # 3. Эквивалент оператора -in для PowerShell 2.0: проверяем, содержит ли массив $ProcessIds этот PID
-                if ($ProcessIds -contains $PidFound) {
-                    # Разбираем строку netstat на понятные свойства и выводим объектом
-                    $Parts = $Line -split '\s+'
-                    New-Object PSObject -Property @{
-                        "Protocol"       = $Parts[0]
-                        "LocalAddress"   = $Parts[1]
-                        "ForeignAddress" = $Parts[2]
-                        "State"          = if ($Parts[0] -eq 'UDP') { "N/A" } else { $Parts[3] }
-                        "OwningProcess"  = $PidFound
-                    }
-                }
-            }
-        } | Format-List
+    foreach ($Root in $Roots) {
+        Get-ChildItem $Root `
+            -Directory `
+            -Recurse `
+            -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Name -match $Pattern
+            } |
+            Select-Object FullName,
+                          CreationTime,
+                          LastWriteTime |
+            Format-List
     }
-    # 1. Запрашиваем абсолютно все правила брандмауэра через netsh
-    # Утилита сама вернет текст на языке локализации ОС (русском или английском)
-    $RulesText = netsh advfirewall firewall show rule name=all verbose
 
-    # Разделяем весь вывод на отдельные блоки (правила разделены строками из дефисов "---")
-    $RuleBlocks = $RulesText -split '-{5,}'
+    # Firewall scan
+    Write-Log "Seeking for ViPNet in firewall rules"
+    $RuleTect = netsh advfirewall firewall show rule name=all 2>$null
+    $CurrentRule = $null
 
-    foreach ($Block in $RuleBlocks) {
-        # 2. Фильтруем правила по ключевым словам 'ViPNet' или 'Infotecs'
-        if ($Block -match 'ViPNet|Infotecs') {
-                    
-            # 3. Собираем данные из текстового блока с помощью регулярных выражений
-            # Конструкция учитывает как английские, так и русские имена полей netsh
-            $Name = if ($Block -match '(?:Rule Name|Имя правила):\s*(.*)') { $Matches[1].Trim() }
-            $Protocol = if ($Block -match '(?:Protocol|Протокол):\s*(.*)') { $Matches[1].Trim() }
-            $LocalPort = if ($Block -match '(?:LocalPort|Локальный порт):\s*(.*)') { $Matches[1].Trim() }
-            $RemotePort = if ($Block -match '(?:RemotePort|Удаленный порт):\s*(.*)') { $Matches[1].Trim() }
-            $Action = if ($Block -match '(?:Action|Действие):\s*(.*)') { $Matches[1].Trim() }
-
-            # Выводим информацию в виде аккуратного объекта для Format-List
-            if ($Name) {
+    foreach ($Line in $RuleText) {
+        if ($Line -match '^(Rule Name|Имя правила)\s*:\s*(.+$') {
+            $CurrentRule = $Matches[2].Trim()
+            if ($CurrentRule -match $Pattern) {
                 New-Object PSObject -Property @{
-                    "DisplayName" = $Name
-                    "Protocol"    = $Protocol
-                    "LocalPort"   = $LocalPort
-                    "RemotePort"  = $RemotePort
-                    "Action"      = $Action
+                    DisplayName = $CurrentRule
                 }
             }
         }
-    } 
+    } | Format-List
 
-    Get-ChildItem Cert:\LocalMachine\My, Cert:\CurrentUser\My -ErrorAction SilentlyContinue |
-    Where-Object {
-        $_.Subject -match 'ViPNet|Infotecs' -or
-        $_.Issuer -match 'ViPNet|Infotecs' -or
-        $_.EnhancedKeyUsageList.FriendlyName -match 'ViPNet|Infotecs'
-    } |
-    Select-Object PSParentPath, Subject, Issuer, Thumbprint,
-    NotBefore, NotAfter, HasPrivateKey, SerialNumber | Format-List
+    # Certificates
+    Write-Log "Seeking for ViPNet certificates"
 
-    certutil -csplist
+    $CertificateStores = @(
+        'Cert:\LocalMachine\My',
+        'Cert:\CurrentUser\My'
+    )
+
+    foreach ($Store in $CertificateStores) {
+
+        Get-ChildItem $Store -ErrorAction SilentlyContinue |
+            Where-Object {
+
+                ($_.Subject -and $_.Subject -match $Pattern) -or
+                ($_.Issuer -and $_.Issuer -match $Pattern) -or
+                ($_.EnhancedKeyUsageList -and
+                    $_.EnhancedKeyUsageList.FriendlyName -match $Pattern)
+
+            } |
+            Select-Object PSParentPath,
+                          Subject,
+                          Issuer,
+                          Thumbprint,
+                          NotBefore,
+                          NotAfter,
+                          HasPrivateKey,
+                          SerialNumber |
+            Format-List
+    }
+
+    # Crypto providers
+    Write-Log "Seeking for ViPNet cryptographic providers"
+    certutil -csplist 2>$null
+    Write-Log "=== VIPNET SEEKING MODULE FINISHED" "Cyan"
 }
 
 # ================================================================================
