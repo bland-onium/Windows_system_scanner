@@ -25,7 +25,7 @@ goto :eof
 
 # HIDING OUTPUT INTO FILE, NOT USING CONSOLE
 
-$script:hidden = $true
+$script:hidden = $false
 
 # Скрываем ли мы вывод консоли
 
@@ -300,13 +300,73 @@ function PeripheralGet {
         "Printer"  = "PNPPrinters"
     }
     foreach ($Target in $Classes.Keys) {
+        Write-Host "`n "
         Write-Log "[$Target]:" 
-        $Devices = Get-PnpDevice -Class $Classes[$Target] -Status OK -ErrorAction SilentlyContinue
+        $ClassName = $Classes[$Target]
+        
+        $Devices = Get-WmiObject -Class Win32_PnPEntity -Filter "PNPClass = '$ClassName'" -ErrorAction SilentlyContinue
+
+        if ($Target -match "Printer|AUDIO") {
+            $Devices = Get-WmiObject -Class Win32_PnPEntity -Filter "PNPClass = '$ClassName'" -ErrorAction SilentlyContinue
+        }
+
         if ($Devices) {
-            $Devices | Format-Table FriendlyName, InstanceId -AutoSize
+            $Result = foreach ($Device in $Devices) {
+                $Model = $Device.FriendlyName
+                if ([string]::IsNullOrEmpty($Model)) { $Model = $Device.Name }
+                $DeviceId = $Device.DeviceId
+                
+                # Try to get USB from InstanceId
+                $SerialNumber = "Unknown"
+
+                if ($Target -eq "Printer") {
+                    $WmiPrint = Get-WmiObject -Class Win32_Printer -Filter "Name = '$($Device.Name)'" -ErrorAction SilentlyContinue
+                    if ($WmiPrint.SerialNumber) { $SerialNumber = $WmiPrint.SerialNumber }
+                }
+
+                if ($Device.InstanceId -match '\\([^\\]+)$') { 
+                $PotentialSerial = $Matches[1] 
+                if ($PotentialSerial -notmatch '&') { $SerialNumber = $PotentialSerial } 
+                } 
+                
+                # Если это USB/HID устройство с амперсандами, ищем его физического родителя
+                if (($SerialNumber -eq "Unknown" -or $SerialNumber -match '&') -and ($DeviceId -like "*VID_*")) { 
+                    # Получаем родительское устройство (USB-контроллер или USB-композитное устройство)
+                    $ParentDevice = Get-CimInstance -ClassName Win32_PnPEntity -Filter "DeviceID = '$($Device.Parent)'" -ErrorAction SilentlyContinue 
+                    
+                    # If parent has technical ID we will go deeper... USB\VID_...
+                    while ($ParentDevice -and $ParentDevice.DeviceId -notlike "USB\*" -and $ParentDevice.Parent) { 
+                        $ParentDevice = Get-CimInstance -ClassName Win32_PnPEntity -Filter "DeviceID = '$($ParentDevice.Parent)'" -ErrorAction SilentlyContinue 
+                    } 
+                    
+                    # Exract real serian number
+                    if ($ParentDevice -and $ParentDevice.InstanceId -match '\\([^\\]+)$') { 
+                        $UsbSerial = $Matches[1] 
+                        # Real serial number
+                        if ($UsbSerial -notmatch '&') { 
+                            $SerialNumber = $UsbSerial 
+                        } 
+                    } 
+                } 
+
+                if ($SerialNumber -eq "Unknown" -and $Target -eq "Printer") {
+                    $WmiPrint = Get-WmiObject -Class Win32_Printer -Filter "Name = '$($Device.Name)'" -ErrorAction SilentlyContinue
+                    if ($WmiPrint.SerialNumber) { $SerialNumber = $WmiPrint.SerialNumber }
+                }
+
+                $Props = @{
+                    "Type"          = $Target
+                    "Model"         = $Model
+                    "Serial number" = $SerialNumber
+                    "Device ID"     = $DeviceId
+                }
+                New-Object PSObject -Property $Props
+            }
+
+            $Result | Format-Table "Type", "Model", "Serial number", "Device ID" -AutoSize
         }
         else {
-            Write-Log "  Подключенные устройства не найдены" -ForegroundColor Gray
+            Write-Log "  Подключенные устройства не найдены" "Error"
         }
     }   
 
@@ -422,6 +482,12 @@ function WindowsOfficeCheck {
     else {
         Write-Log "[BAD] Windows is NOT activated." "Error"
     }
+
+    Write-Log "Windows version"
+    Get-WmiObject -Class Win32_OperatingSystem | Select Caption, Version, BuildNmber | Format-List
+    Write-log "Office version"
+    Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object {$_.DisplayName -like "*Office*"} | Select-Object DisplayName, DisplayVersion | Format-List
+
 
     # --- Office Activation Check ---
     Write-Log "`n=== Checking Office Licenses ===" "Warning"
