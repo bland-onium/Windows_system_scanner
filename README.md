@@ -1,5 +1,15 @@
 # WINDOWS SCANNER & OPTIMIZER
 
+half-testing mode. ATTENTION
+from last update Checker got a lot of silent updates: it lost functions of enhancing of PC and installing Win\Office licenses but instead it got:
+- Multi-Thread
+- Logical log-writing engine
+- protection from writing logs on another USB
+- NO admin rules required
+- Now everything stay in one .bat file instead of .ps1 and .bat together
+- It got stronger USB, ViPNet and Object searching engines
+- It works on 70% DOS-systems (not Win XP, but 7, 8, 8.1, 10 and 11 work straight)
+
 This script made for automatical scanning system components, seeking for licenses, adding more optimisation in system and 
 Программа создана для автоматизированного сканирования системных компоненов, обнаруживания лицензий и всей необходимой информации.э
 
