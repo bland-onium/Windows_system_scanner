@@ -76,20 +76,35 @@ function Write-Log {
 function Invoke-ParallelWithOrder {
     param(
         [Parameter(Mandatory=$true)]
-        [array]$ScriptBlocks,                                        # <-- имя параметра
+        [array]$ScriptBlocks,
         [int]$ThrottleLimit = [Environment]::ProcessorCount
     )
 
-    $Pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit)
+    # --- 1. Собираем все функции текущей сессии в ISS ---
+    $ExcludeFunctions = @('Invoke-ParallelWithOrder', 'prompt', 'TabExpansion2', 'TabExpansion')
+    $ISS = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    Get-ChildItem Function:\ | Where-Object { $ExcludeFunctions -notcontains $_.Name } | ForEach-Object {
+        try {
+            $ISS.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                    $_.Name, $_.Definition
+                )
+            )
+        } catch { }
+    }
+
+    # --- 2. Пул, знающий про эти функции ---
+    $Pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit, $ISS, $Host)
     $Pool.Open()
 
-    # КЛЮЧЕВОЕ: $ScriptBlocks (а не $Tasks)
     $LaunchOrder = $ScriptBlocks | Sort-Object LaunchWeight -Descending
 
     $Jobs = @()
     foreach ($Task in $LaunchOrder) {
-        $PS = [powershell]::Create().AddScript($Task.Block).AddArgument($Task.OutputIndex)
+        $PS = [powershell]::Create()
         $PS.RunspacePool = $Pool
+        # .ToString() — чтобы гарантированно передать строку, а не объект
+        [void]$PS.AddScript($Task.Block.ToString()).AddArgument($Task.OutputIndex)
         $Jobs += [PSCustomObject]@{
             OutputIndex = $Task.OutputIndex
             Name        = $Task.Name
@@ -98,20 +113,43 @@ function Invoke-ParallelWithOrder {
         }
     }
 
+    # --- 3. Сбор результатов: Streams.Error + защита от пустоты ---
     $Results = foreach ($Job in $Jobs) {
+        $outObj = $null
         try {
             $Out = $Job.PS.EndInvoke($Job.Handle)
-            if ($Out) { $Out }
+
+            # Ошибки из Runspace лежат тут, а не в исключении
+            if ($Job.PS.Streams.Error.Count -gt 0) {
+                $errText = ($Job.PS.Streams.Error | ForEach-Object { $_.ToString() }) -join "`n"
+                $outObj = [PSCustomObject]@{
+                    Index    = $Job.OutputIndex
+                    Messages = @(@{ Message = "ERROR in $($Job.Name): $errText"; EntryType = "Error" })
+                }
+            }
+            elseif ($null -ne $Out) {
+                # EndInvoke может вернуть массив — отбираем только наши пакеты
+                foreach ($Item in @($Out)) {
+                    if ($null -ne $Item -and $Item.PSObject.Properties['Index']) { $outObj = $Item }
+                }
+            }
+            else {
+                $outObj = [PSCustomObject]@{
+                    Index    = $Job.OutputIndex
+                    Messages = @(@{ Message = "EMPTY OUTPUT in $($Job.Name)"; EntryType = "Warning" })
+                }
+            }
         }
         catch {
-            [PSCustomObject]@{
+            $outObj = [PSCustomObject]@{
                 Index    = $Job.OutputIndex
-                Messages = @(@{ Message = "ERROR in $($Job.Name): $_"; EntryType = "Error" })
+                Messages = @(@{ Message = "EXCEPTION in $($Job.Name): $_"; EntryType = "Error" })
             }
         }
         finally {
             $Job.PS.Dispose()
         }
+        $outObj
     }
 
     $Pool.Close()
