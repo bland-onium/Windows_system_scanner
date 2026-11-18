@@ -76,7 +76,7 @@ function Write-Log {
 function Invoke-ParallelWithOrder {
     param(
         [Parameter(Mandatory=$true)]
-        [array]$Tasks,
+        [array]$ScriptBlocks,
         [int]$ThrottleLimit = [Environment]::ProcessorCount
     )
 
@@ -243,7 +243,7 @@ function CPUGet {
                 Select-Object -Property * |
                 Format-List |
                 Out-String -Width 4096
-        [void]$Messages.Add (@{ Message = $Raw; EntryType = "Information" })
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
     }        
     else {
         $Data = Get-WmiObject -Class Win32_Processor | ForEach-Object {
@@ -1022,7 +1022,7 @@ else {
 # Определение задач по порядку вывода
 # OutputIndex — порядок вывода
 # LaunchWeight — приоритет запуска (тяжёлые раньше)
-$Tasks = @(
+$TaskBlocks = @(
     [PSCustomObject]@{ Name='WindowsOfficeCheck'; LaunchWeight=30;  OutputIndex=0;  Block={ param($o) WindowsOfficeCheck -OutputIndex $o } }
     [PSCustomObject]@{ Name='IpAdressGet';        LaunchWeight=5;   OutputIndex=1;  Block={ param($o) IpAdressGet        -OutputIndex $o } }
     [PSCustomObject]@{ Name='NetAdapterGet';      LaunchWeight=5;   OutputIndex=2;  Block={ param($o) NetAdapterGet      -OutputIndex $o } }
