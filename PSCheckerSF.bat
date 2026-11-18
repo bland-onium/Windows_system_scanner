@@ -77,10 +77,10 @@ function Invoke-ParallelWithOrder {
     param(
         [Parameter(Mandatory=$true)]
         [array]$ScriptBlocks,
-        [int]$ThrottleLimit = [Environment]::ProcessorCount
+        [int]$ThrottleLimit = [Environment]::ProcessorCount,
+        [bool]$UseFullOutput = $false        # <-- новый параметр
     )
 
-    # --- 1. Собираем все функции текущей сессии в ISS ---
     $ExcludeFunctions = @('Invoke-ParallelWithOrder', 'prompt', 'TabExpansion2', 'TabExpansion')
     $ISS = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     Get-ChildItem Function:\ | Where-Object { $ExcludeFunctions -notcontains $_.Name } | ForEach-Object {
@@ -93,7 +93,6 @@ function Invoke-ParallelWithOrder {
         } catch { }
     }
 
-    # --- 2. Пул, знающий про эти функции ---
     $Pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit, $ISS, $Host)
     $Pool.Open()
 
@@ -103,8 +102,8 @@ function Invoke-ParallelWithOrder {
     foreach ($Task in $LaunchOrder) {
         $PS = [powershell]::Create()
         $PS.RunspacePool = $Pool
-        # .ToString() — чтобы гарантированно передать строку, а не объект
-        [void]$PS.AddScript($Task.Block.ToString()).AddArgument($Task.OutputIndex)
+        # ВТОРОЙ аргумент — флаг -On
+        [void]$PS.AddScript($Task.Block.ToString()).AddArgument($Task.OutputIndex).AddArgument($UseFullOutput)
         $Jobs += [PSCustomObject]@{
             OutputIndex = $Task.OutputIndex
             Name        = $Task.Name
@@ -113,13 +112,10 @@ function Invoke-ParallelWithOrder {
         }
     }
 
-    # --- 3. Сбор результатов: Streams.Error + защита от пустоты ---
     $Results = foreach ($Job in $Jobs) {
         $outObj = $null
         try {
             $Out = $Job.PS.EndInvoke($Job.Handle)
-
-            # Ошибки из Runspace лежат тут, а не в исключении
             if ($Job.PS.Streams.Error.Count -gt 0) {
                 $errText = ($Job.PS.Streams.Error | ForEach-Object { $_.ToString() }) -join "`n"
                 $outObj = [PSCustomObject]@{
@@ -128,7 +124,6 @@ function Invoke-ParallelWithOrder {
                 }
             }
             elseif ($null -ne $Out) {
-                # EndInvoke может вернуть массив — отбираем только наши пакеты
                 foreach ($Item in @($Out)) {
                     if ($null -ne $Item -and $Item.PSObject.Properties['Index']) { $outObj = $Item }
                 }
@@ -146,9 +141,7 @@ function Invoke-ParallelWithOrder {
                 Messages = @(@{ Message = "EXCEPTION in $($Job.Name): $_"; EntryType = "Error" })
             }
         }
-        finally {
-            $Job.PS.Dispose()
-        }
+        finally { $Job.PS.Dispose() }
         $outObj
     }
 
@@ -921,6 +914,7 @@ Add-Content -Path "$env:TEMP\log.txt" -Value "We hope code is hidden"
 # =========================================================================
 # БЛОК 1: ОПРЕДЕЛЕНИЕ ИМЕНИ ПК И ПОИСК ФЛЕШКИ
 # =========================================================================
+Write-Log "PSChecker version: 6"
 $ComputerName = $env:COMPUTERNAME
 $BiosInfo = Get-WmiObject -Class Win32_BIOS -ErrorAction SilentlyContinue
 if ($BiosInfo -and $BiosInfo.PSComputerName) { $ComputerName = $BiosInfo.PSComputerName }
@@ -1000,25 +994,44 @@ else {
 
 
 
+# Режим вывода
+$UseFullOutput = $false
 
+if ($Hidden) {
+    $UseFullOutput = $true
+    Write-Log "=== HIDDEN MODE: full output (-On) enabled automatically ===" "Cyan"
+}
+else {
+    $answer = Read-Host "Get extended (-On) data for all subsystems? This significantly increases output size (y/n)"
+    if ($answer -match '^(y|yes|д|да)$') {
+        $UseFullOutput = $true
+        Write-Log "=== User chose FULL output (-On) ===" "Cyan"
+    }
+    else {
+        $UseFullOutput = $false
+        Write-Log "=== User chose SUMMARY output (-On disabled) ===" "Cyan"
+    }
+}
 # Определение задач по порядку вывода
 # OutputIndex — порядок вывода
 # LaunchWeight — приоритет запуска (тяжёлые раньше)
 $TaskBlocks = @(
-    [PSCustomObject]@{ Name='WindowsOfficeCheck'; LaunchWeight=30;  OutputIndex=0;  Block={ param($o) WindowsOfficeCheck -TaskIndex $o } }
-    [PSCustomObject]@{ Name='IpAdressGet';        LaunchWeight=5;   OutputIndex=1;  Block={ param($o) IpAdressGet        -TaskIndex $o } }
-    [PSCustomObject]@{ Name='NetAdapterGet';      LaunchWeight=5;   OutputIndex=2;  Block={ param($o) NetAdapterGet      -TaskIndex $o } }
-    [PSCustomObject]@{ Name='CPUGet';             LaunchWeight=10;  OutputIndex=3;  Block={ param($o) CPUGet             -TaskIndex $o } }
-    [PSCustomObject]@{ Name='VRAMGet';            LaunchWeight=10;  OutputIndex=4;  Block={ param($o) VRAMGet            -TaskIndex $o } }
-    [PSCustomObject]@{ Name='RAMGet';             LaunchWeight=10;  OutputIndex=5;  Block={ param($o) RAMGet             -TaskIndex $o } }
-    [PSCustomObject]@{ Name='DiskGet';            LaunchWeight=70;  OutputIndex=6;  Block={ param($o) DiskGet            -TaskIndex $o } }
-    [PSCustomObject]@{ Name='BIOSGet';            LaunchWeight=90;  OutputIndex=7;  Block={ param($o) BIOSGet            -TaskIndex $o } }
-    [PSCustomObject]@{ Name='MonitorGet';         LaunchWeight=15;  OutputIndex=8;  Block={ param($o) MonitorGet         -TaskIndex $o } }
-    [PSCustomObject]@{ Name='PeripheralGet';      LaunchWeight=40;  OutputIndex=9;  Block={ param($o) PeripheralGet      -TaskIndex $o } }
-    [PSCustomObject]@{ Name='SeekObjects';        LaunchWeight=100; OutputIndex=10; Block={ param($o) SeekObjects        -TaskIndex $o } }
-    [PSCustomObject]@{ Name='ViPNeTSeek';         LaunchWeight=95;  OutputIndex=11; Block={ param($o) ViPNeTSeek         -TaskIndex $o } }
+    [PSCustomObject]@{ Name='WindowsOfficeCheck'; LaunchWeight=30;  OutputIndex=0;  Block={ param($o,$f) WindowsOfficeCheck -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='IpAdressGet';        LaunchWeight=5;   OutputIndex=1;  Block={ param($o,$f) IpAdressGet        -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='NetAdapterGet';      LaunchWeight=5;   OutputIndex=2;  Block={ param($o,$f) NetAdapterGet      -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='CPUGet';             LaunchWeight=10;  OutputIndex=3;  Block={ param($o,$f) CPUGet             -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='VRAMGet';            LaunchWeight=10;  OutputIndex=4;  Block={ param($o,$f) VRAMGet            -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='RAMGet';             LaunchWeight=10;  OutputIndex=5;  Block={ param($o,$f) RAMGet             -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='DiskGet';            LaunchWeight=70;  OutputIndex=6;  Block={ param($o,$f) DiskGet            -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='BIOSGet';            LaunchWeight=90;  OutputIndex=7;  Block={ param($o,$f) BIOSGet            -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='MonitorGet';         LaunchWeight=15;  OutputIndex=8;  Block={ param($o,$f) MonitorGet         -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='PeripheralGet';      LaunchWeight=40;  OutputIndex=9;  Block={ param($o,$f) PeripheralGet      -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='SeekObjects';        LaunchWeight=100; OutputIndex=10; Block={ param($o,$f) SeekObjects        -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='ViPNeTSeek';         LaunchWeight=95;  OutputIndex=11; Block={ param($o,$f) ViPNeTSeek         -TaskIndex $o -On:$f } }
 )
 
+Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount), FullOutput = $UseFullOutput) ===" "Cyan"
+$Results = Invoke-ParallelWithOrder -ScriptBlocks $TaskBlocks -UseFullOutput $UseFullOutput
 Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount)) ===" "Cyan"
 $Results = Invoke-ParallelWithOrder -ScriptBlocks $TaskBlocks
 
