@@ -37,13 +37,16 @@ function Write-Log {
     )
         
     # 1. Определяем цвет для консоли на основе переданного EntryType
-    if ($EntryType -eq "Good") { $Color = "Green" }
-    elseif ($EntryType -eq "Error") { $Color = "Red" }
-    elseif ($EntryType -eq "Warning") { $Color = "Yellow" }
-    elseif ($EntryType -eq "Cyan") { $Color = "Cyan" }
-    else { $Color = "White" }
+    if ($EntryType -eq "Good")          { $Color = "Green" }
+    elseif ($EntryType -eq "Error")     { $Color = "Red" }
+    elseif ($EntryType -eq "Warning")   { $Color = "Yellow" }
+    elseif ($EntryType -eq "Cyan")      { $Color = "Cyan" }
+    elseif ($EntryType -eq "Progress")  { $Color = "DarkGray" }
+    else                                { $Color = "White" }
         
     Write-Host $Message -ForegroundColor $Color
+
+    if ($EntryType -eq "Progress") {return}
     
     if ($script:hidden){
         # 2. Приводим EntryType к валидному системному типу для Event Log.
@@ -72,71 +75,202 @@ function Write-Log {
     }
 }
 
+# Пробуем в параллельные вычисления
+function Invoke-ParallelWithOrder {
+    param(
+        [Parameter(Mandatory=$true)]
+        [array]$ScriptBlocks,
+        [int]$ThrottleLimit = [Environment]::ProcessorCount,
+        [bool]$UseFullOutput = $false,
+        [scriptblock]$ProgressCallback = { param($m) Write-Host $m -ForegroundColor DarkGray },
+        [int]$PollIntervalMs = 200
+    )
+
+    # --- ISS с функциями (как раньше) ---
+    $ExcludeFunctions = @('Invoke-ParallelWithOrder','prompt','TabExpansion2','TabExpansion')
+    $ISS = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
+    Get-ChildItem Function:\ | Where-Object { $ExcludeFunctions -notcontains $_.Name } | ForEach-Object {
+        try {
+            $ISS.Commands.Add(
+                [System.Management.Automation.Runspaces.SessionStateFunctionEntry]::new(
+                    $_.Name, $_.Definition
+                )
+            )
+        } catch { }
+    }
+
+    $Pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit, $ISS, $Host)
+    $Pool.Open()
+
+    $LaunchOrder = $ScriptBlocks | Sort-Object LaunchWeight -Descending
+
+    # --- Запуск ---
+    $Jobs = @()
+    foreach ($Task in $LaunchOrder) {
+        $PS = [powershell]::Create()
+        $PS.RunspacePool = $Pool
+        [void]$PS.AddScript($Task.Block.ToString()).AddArgument($Task.OutputIndex).AddArgument($UseFullOutput)
+        $Jobs += [PSCustomObject]@{
+            OutputIndex = $Task.OutputIndex
+            Name        = $Task.Name
+            PS          = $PS
+            Handle      = $PS.BeginInvoke()
+            Completed   = $false
+        }
+    }
+
+    $Total     = $Jobs.Count
+    $Completed = 0
+    $StartAt   = Get-Date
+
+    & $ProgressCallback "=== $Total task(s) launched, waiting for completion... ==="
+
+    # --- Polling-цикл: печатаем статус по мере готовности ---
+    while ($Completed -lt $Total) {
+        foreach ($Job in $Jobs) {
+            if (-not $Job.Completed -and $Job.Handle.IsCompleted) {
+                $Job.Completed = $true
+                $Completed++
+                $Elapsed = [math]::Round(((Get-Date) - $StartAt).TotalSeconds, 1)
+                & $ProgressCallback ("[{0}/{1}] {2} (Index={3}) finished in {4}s" -f `
+                    $Completed, $Total, $Job.Name, $Job.OutputIndex, $Elapsed)
+            }
+        }
+        Start-Sleep -Milliseconds $PollIntervalMs
+    }
+
+    # --- Сбор результатов: всё уже готово, EndInvoke мгновенный ---
+    $Results = foreach ($Job in $Jobs) {
+        $outObj = $null
+        try {
+            $Out = $Job.PS.EndInvoke($Job.Handle)
+            if ($Job.PS.Streams.Error.Count -gt 0) {
+                $errText = ($Job.PS.Streams.Error | ForEach-Object { $_.ToString() }) -join "`n"
+                $outObj = [PSCustomObject]@{
+                    Index    = $Job.OutputIndex
+                    Messages = @(@{ Message = "ERROR in $($Job.Name): $errText"; EntryType = "Error" })
+                }
+            }
+            elseif ($null -ne $Out) {
+                foreach ($Item in @($Out)) {
+                    if ($null -ne $Item -and $Item.PSObject.Properties['Index']) { $outObj = $Item }
+                }
+            }
+            else {
+                $outObj = [PSCustomObject]@{
+                    Index    = $Job.OutputIndex
+                    Messages = @(@{ Message = "EMPTY OUTPUT in $($Job.Name)"; EntryType = "Warning" })
+                }
+            }
+        }
+        catch {
+            $outObj = [PSCustomObject]@{
+                Index    = $Job.OutputIndex
+                Messages = @(@{ Message = "EXCEPTION in $($Job.Name): $_"; EntryType = "Error" })
+            }
+        }
+        finally { $Job.PS.Dispose() }
+        $outObj
+    }
+
+    $Pool.Close()
+    $Pool.Dispose()
+
+    $TotalElapsed = [math]::Round(((Get-Date) - $StartAt).TotalSeconds, 1)
+    & $ProgressCallback "=== All $Total task(s) finished in ${TotalElapsed}s ==="
+
+    return ($Results | Sort-Object Index)
+}
 
 # Функция, берущая IP адресс системы
 function IpAdressGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting IP adress ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting IP adress ===" "Cyan"
-        # Обращаемся к конфигу сетевой карты и смотрим какие драйверы вообще включены
-        $adapters = Get-WmiObject -Class Win32_NetworkAdapterConfiguration | Format-List *
-    }
+        $Raw = Get-WmiObject -Class Win32_NetworkAdapterConfiguration | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting IP adress ===" "Cyan"
-        # Обращаемся к конфигу сетевой карты и смотрим какие драйверы вообще включены
         $adapters = Get-WmiObject -Class Win32_NetworkAdapterConfiguration -Filter "IPEnabled = 'True'"
-        # Print all necessary data as table
         foreach ($adapter in $adapters) {
-            Write-Log "Network Adapter : $($adapter.Description)"
-            Write-Log "IP Adress(es)   : $($adapter.IPAddress -join ', ')"
-            Write-Log "Subnet Mask     : $($adapter.IPSubnet -join ', ')" 
-            Write-Log "Default Gateway : $($adapter.DefaultIPGateway -join ', ')"
-            Write-Log "MAC Adress      : $($adapter.MACAdress)"
-            Write-Log (" ")
+            [void]$Messages.Add(@{ Message = "Network Adapter : $($adapter.Description)"; EntryType = "Information" })
+            [void]$Messages.Add(@{ Message = "IP Adress(es)   : $($adapter.IPAddress -join ', ')"; EntryType = "Information" })
+            [void]$Messages.Add(@{ Message = "Subnet Mask     : $($adapter.IPSubnet -join ', ')"; EntryType = "Information" })
+            [void]$Messages.Add(@{ Message = "Default Gateway : $($adapter.DefaultIPGateway -join ', ')"; EntryType = "Information" })
+            [void]$Messages.Add(@{ Message = "MAC Adress      : $($adapter.MACAdress)"; EntryType = "Information" })
+            [void]$Messages.Add(@{ Message = " "; EntryType = "Information" })
         }
     }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
+    }
 }
+
 # Функция, сканирующяа сетевые адаптеры
 function NetAdapterGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data about network adapters ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data about network adapters ===" "Cyan"
-        Get-WmiObject -Class Win32_NetworkAdapter | Format-List *
-    }
+        $Raw = Get-WmiObject -Class Win32_NetworkAdapter | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting data about network adapters ===" "Cyan"
-        Get-WmiObject -Class Win32_NetworkAdapter -Filter "PhysicalAdapter = True" |
-        ForEach-Object {
+        $Data = Get-WmiObject -Class Win32_NetworkAdapter -Filter "PhysicalAdapter = True" | ForEach-Object {
             New-Object PSObject -Property @{
                 "Name"        = $_.Name
                 "DeviceID"    = $_.DeviceID
-                "MACAdress"   = $_.MACAdress
+                "MACAddress"   = $_.MACAddress
                 "AdapterType" = $_.AdapterType
                 "NetEnabled"  = $_.NetEnabled
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Data; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
+
 
 # Функция, берущая данные из BIOS
 function BIOSGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data from BIOS ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data from BIOS ===" "Cyan"
-        Get-WmiObject -Class Win32_BIOS | Select-Object -Property * | Format-List
-    }
+        $Raw = Get-WmiObject -Class Win32_BIOS | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting data from BIOS ===" "Cyan"
-        Get-WmiObject -Class Win32_BIOS | ForEach-Object {
+        $Data = Get-WmiObject -Class Win32_BIOS | ForEach-Object {
             New-Object PSObject -Property @{
                 "ComputerName" = $_.PSComputerName
                 "Name"         = $_.Name
@@ -144,23 +278,35 @@ function BIOSGet {
                 "SerialNumber" = $_.SerialNumber
                 "Manufacturer" = $_.Manufacturer
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Data; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
+
 
 # Функция, берущая данные от процессора
 function CPUGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data from CPU ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data from CPU ===" "Cyan"
-        Get-WmiObject -Class Win32_Processor | Select-Object -Property * | Format-List
-    }
+        $Raw = Get-WmiObject -Class Win32_Processor | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting data from CPU ===" "Cyan"
-        Get-WmiObject -Class Win32_Processor | ForEach-Object {
+        $Data = Get-WmiObject -Class Win32_Processor | ForEach-Object {
             New-Object PSObject -Property @{
                 "Name"         = $_.Name
                 "ComputerName" = $_.PSComputerName
@@ -168,24 +314,34 @@ function CPUGet {
                 "ProcessorID"  = $_.ProcessorID
                 "Manufacturer" = $_.Manufacturer
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Data; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
 
 # Функция, берущая данные из оперативной памяти
 function RAMGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data from RAM ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data from RAM ===" "Cyan"
-        Get-WmiObject -Class Win32_PhysicalMemory | Select-Object -Property * | Format-List
-    }
+        $Raw = Get-WmiObject -Class Win32_PhysicalMemory | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting data from RAM ===" "Cyan"
-        # Calls special data from RAM
-        Get-WmiObject -Class Win32_PhysicalMemory | ForEach-Object {
+        $Data = Get-WmiObject -Class Win32_PhysicalMemory | ForEach-Object {
             New-Object PSObject -Property @{
                 "Slot"       = $_.DeviceLocator
                 "Size(Gb)"   = [math]::round($_.Capacity / 1GB, 1)
@@ -193,24 +349,35 @@ function RAMGet {
                 "Vendor"     = $_.Manufacturer.Trim()
                 "PartNumber" = $_.PartNumber
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Data; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
+
 
 # Функция, берущая данные от видеокарты
 function VRAMGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data from GPU ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data from GPU ===" "Cyan"
-        Get-WmiObject -Class Win32_VideoController | Select-Object -Property * | Format-List
-    }
+        $Raw = Get-WmiObject -Class Win32_VideoController | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting data from GPU ===" "Cyan"
-        # Calls some of required data from VideoCard
-        Get-WmiObject -Class Win32_VideoController | ForEach-Object {
+        $Data = Get-WmiObject -Class Win32_VideoController | ForEach-Object {
             New-Object PSObject -Property @{
                 "Name"         = $_.Name
                 "Memory"       = [math]::round($_.AdapterRAM / 1MB, 0)
@@ -218,28 +385,44 @@ function VRAMGet {
                 "ProcessorID"  = $_.ProcessorID
                 "Manufacturer" = $_.Manufacturer
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Data; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
+
 
 # Функция, обращающаяся к диску и берущая инфу из него
 function DiskGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data about disks ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data about disks ===" "Cyan"
-        Write-Log "Physical disks: " "Warning"
-        Get-WmiObject -Class Win32_DiskDrive | Select-Object -Property * | Format-List
-        Write-Log "Logical volumes: " "Warning"
-        Get-WmiObject -Class Win32_LogicalDisk | Select-Object -Property * | Format-List
-    }
+        [void]$Messages.Add(@{ Message = "Physical disks: "; EntryType = "Warning" })
+        $RawDisks = Get-WmiObject -Class Win32_DiskDrive | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $RawDisks; EntryType = "Information" })
+
+        [void]$Messages.Add(@{ Message = "Logical volumes: "; EntryType = "Warning" })
+        $RawVolumes = Get-WmiObject -Class Win32_LogicalDisk | 
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $RawVolumes; EntryType = "Information" })
+    }        
     else {
-        Write-Log "=== Getting data about disks ===" "Cyan"
-        Write-Log "Physical disks: " "Warning"
-        # This command calls physical Disk driver
-        Get-WmiObject -Class Win32_DiskDrive | ForEach-Object {
+        [void]$Messages.Add(@{ Message = "Physical disks: "; EntryType = "Warning" })
+        $DataDisks = Get-WmiObject -Class Win32_DiskDrive | ForEach-Object {
             New-Object PSObject -Property @{
                 "Name"         = $_.Name
                 "Model"        = $_.Model
@@ -247,13 +430,12 @@ function DiskGet {
                 "Type"         = $_.InterfaceType
                 "PartNumber"   = $_.PartNumber
                 "Manufacturer" = $_.Manufacturer
-
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $DataDisks; EntryType = "Information" })
 
-        Write-Log "Logical volumes: " "Warning"
-        # This command calls logical Disks
-        Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType = 3" | ForEach-Object {
+        [void]$Messages.Add(@{ Message = "Logical volumes: "; EntryType = "Warning" })
+        $DataVolumes = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType = 3" | ForEach-Object {
             New-Object PSObject -Property @{
                 "Disk"         = $_.DeviceID
                 "Size (GB)"    = [math]::round($_.Size / 1GB, 1)
@@ -262,24 +444,35 @@ function DiskGet {
                 "PartNumber"   = $_.PartNumber
                 "Manufacturer" = $_.Manufacturer
             }
-        } | Format-List
+        } | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $DataVolumes; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
 
 function MonitorGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
-    Write-Host "`n "
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data about monitor ==="; EntryType = "Cyan" })
     if ($On) {
-        Write-Log "=== Getting data about monitor ===" "Cyan"
-        Get-WmiObject -Namespace "root\wmi" -Class "WmiMonitorID"
+        $Raw = Get-WmiObject -Namespace "root\wmi" -Class "WmiMonitorID" |
+                Select-Object -Property * |
+                Format-List |
+                Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $Raw; EntryType = "Information" })
     }
     else {
-        Write-Log "=== Getting data about monitor ===" "Cyan"
         $Monitors = Get-WmiObject -Namespace "root\wmi" -Class "WmiMonitorID"
 
-        foreach ($Monitor in $Monitors) {
+        $Data = foreach ($Monitor in $Monitors) {
             $Namebytes = $Monitor.UserFriendlyName | Where-Object { $_ -ne 0 }
             $MonitorName = if ($Namebytes) { [System.Text.Encoding]::ASCII.GetString($Namebytes) } else { "Unknown" }
 
@@ -290,142 +483,177 @@ function MonitorGet {
                 "Model"    = $MonitorName
                 "Serial N" = $SerialNumber
                 "Part ID"  = $Monitor.InstanceName
-            } | Format-List
+            }
         }
+        $FormattedData = $Data | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $FormattedData; EntryType = "Information" })
+    }
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
 
-
 function PeripheralGet {
     param (
-        [switch]$On
+        [switch]$On,
+        [int]$TaskIndex = 0
     )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n ";     EntryType = "Information"})
+    [void]$Messages.Add(@{ Message = "=== Getting data about peripherals ==="; EntryType = "Cyan" })
+
     $Classes = @{
         "Keyboard" = "Keyboard"
         "Mouse"    = "Mouse"
         "AUDIO"    = "Volume"
         "Printer"  = "PNPPrinters"
     }
+
     foreach ($Target in $Classes.Keys) {
-        Write-Host "`n "
-        Write-Log "[$Target]:" 
+        [void]$Messages.Add(@{ Message = "`n "; EntryType = "Information" })
+        [void]$Messages.Add(@{ Message = "[$Target]:"; EntryType = "Information" })
         $ClassName = $Classes[$Target]
         
         $Devices = Get-WmiObject -Class Win32_PnPEntity -Filter "PNPClass = '$ClassName'" -ErrorAction SilentlyContinue
 
-        if ($Target -match "Printer|AUDIO") {
-            $Devices = Get-WmiObject -Class Win32_PnPEntity -Filter "PNPClass = '$ClassName'" -ErrorAction SilentlyContinue
-        }
-
         if ($Devices) {
-            $Result = foreach ($Device in $Devices) {
-                $Model = $Device.FriendlyName
-                if ([string]::IsNullOrEmpty($Model)) { $Model = $Device.Name }
-                $DeviceId = $Device.DeviceId
-                
-                # Try to get USB from InstanceId
-                $SerialNumber = "Unknown"
-
-                if ($Target -eq "Printer") {
-                    $WmiPrint = Get-WmiObject -Class Win32_Printer -Filter "Name = '$($Device.Name)'" -ErrorAction SilentlyContinue
-                    if ($WmiPrint.SerialNumber) { $SerialNumber = $WmiPrint.SerialNumber }
-                }
-
-                if ($Device.InstanceId -match '\\([^\\]+)$') { 
-                $PotentialSerial = $Matches[1] 
-                if ($PotentialSerial -notmatch '&') { $SerialNumber = $PotentialSerial } 
-                } 
-                
-                # Если это USB/HID устройство с амперсандами, ищем его физического родителя
-                if (($SerialNumber -eq "Unknown" -or $SerialNumber -match '&') -and ($DeviceId -like "*VID_*")) { 
-                    # Получаем родительское устройство (USB-контроллер или USB-композитное устройство)
-                    $ParentDevice = Get-WmiObject -Class Win32_PnPEntity -Filter "DeviceID = '$($Device.Parent)'" -ErrorAction SilentlyContinue 
+            if ($On) {
+                $RawDevices = $Devices | 
+                    Select-Object -Property * | 
+                    Format-List | 
+                    Out-String -Width 4096
+                [void]$Messages.Add(@{ Message = $RawDevices; EntryType = "Information" })
+            }
+            else {
+                $Result = foreach ($Device in $Devices) {
+                    $Model = $Device.FriendlyName
+                    if ([string]::IsNullOrEmpty($Model)) { $Model = $Device.Name }
+                    $DeviceId = $Device.DeviceId
                     
-                    # If parent has technical ID we will go deeper... USB\VID_...
-                    while ($ParentDevice -and $ParentDevice.DeviceId -notlike "USB\*" -and $ParentDevice.Parent) { 
-                        $ParentDevice = Get-WmiObject -ClassName Win32_PnPEntity -Filter "DeviceID = '$($ParentDevice.Parent)'" -ErrorAction SilentlyContinue 
+                    $SerialNumber = "Unknown"
+
+                    if ($Target -eq "Printer") {
+                        $SafeName = $Device.Name -replace "'", "''"
+                        $WmiPrint = Get-WmiObject -Class Win32_Printer -Filter "Name = '$SafeName'" -ErrorAction SilentlyContinue
+                        if ($WmiPrint.SerialNumber) { $SerialNumber = $WmiPrint.SerialNumber }
+                    }
+
+                    if ($Device.InstanceId -match '\\([^\\]+)$') { 
+                        $PotentialSerial = $Matches[1] 
+                        if ($PotentialSerial -notmatch '&') { $SerialNumber = $PotentialSerial } 
                     } 
                     
-                    # Exract real serian number
-                    if ($ParentDevice -and $ParentDevice.InstanceId -match '\\([^\\]+)$') { 
-                        $UsbSerial = $Matches[1] 
-                        # Real serial number
-                        if ($UsbSerial -notmatch '&') { 
-                            $SerialNumber = $UsbSerial 
+                    if (($SerialNumber -eq "Unknown" -or $SerialNumber -match '&') -and ($DeviceId -like "*VID_*")) { 
+                        $SafeParentId = $Device.Parent -replace '\\', '\\'
+                        $ParentDevice = Get-WmiObject -Class Win32_PnPEntity -Filter "DeviceID = '$SafeParentId'" -ErrorAction SilentlyContinue 
+                        
+                        while ($ParentDevice -and $ParentDevice.DeviceId -notlike "USB\*" -and $ParentDevice.Parent) { 
+                            $SafeNextParentId = $ParentDevice.Parent -replace '\\', '\\'
+                            $ParentDevice = Get-WmiObject -Class Win32_PnPEntity -Filter "DeviceID = '$SafeNextParentId'" -ErrorAction SilentlyContinue 
+                        } 
+                        
+                        if ($ParentDevice -and $ParentDevice.InstanceId -match '\\([^\\]+)$') { 
+                            $UsbSerial = $Matches[1] 
+                            if ($UsbSerial -notmatch '&') { 
+                                $SerialNumber = $UsbSerial 
+                            } 
                         } 
                     } 
-                } 
 
-                if ($SerialNumber -eq "Unknown" -and $Target -eq "Printer") {
-                    $WmiPrint = Get-WmiObject -Class Win32_Printer -Filter "Name = '$($Device.Name)'" -ErrorAction SilentlyContinue
-                    if ($WmiPrint.SerialNumber) { $SerialNumber = $WmiPrint.SerialNumber }
+                    $Props = @{
+                        "Type"          = $Target
+                        "Model"         = $Model
+                        "Serial number" = $SerialNumber
+                        "Device ID"     = $DeviceId
+                    }
+                    New-Object PSObject -Property $Props
                 }
 
-                $Props = @{
-                    "Type"          = $Target
-                    "Model"         = $Model
-                    "Serial number" = $SerialNumber
-                    "Device ID"     = $DeviceId
-                }
-                New-Object PSObject -Property $Props
+                $FormattedResult = $Result | Format-Table "Type", "Model", "Serial number", "Device ID" -AutoSize | Out-String -Width 4096
+                [void]$Messages.Add(@{ Message = $FormattedResult; EntryType = "Information" })
             }
-
-            $Result | Format-Table "Type", "Model", "Serial number", "Device ID" -AutoSize
         }
         else {
-            Write-Log "  Подключенные устройства не найдены" "Error"
+            [void]$Messages.Add(@{ Message = "  Подключенные устройства не найдены"; EntryType = "Error" })
         }
     }   
 
     # 3. ПОЛУЧЕНИЕ ДАННЫХ О ФЛЕШКАХ И СЪЕМНЫХ НОСИТЕЛЯХ
-    Write-Log "`n=== REMOVABLE DISKS ===" "Cyan"
-    # Вариант 1: Логические диски (буква, файловая система, объем)
-    Write-Log "Logical USB-disks" 
-    $UsbDrives = Get-WmiObject -Class Win32_Volume | Where-Object { $_.DriveType -eq 2 } # 2 = Съемный диск
+    [void]$Messages.Add(@{ Message = "`n "; EntryType = "Information" })
+    [void]$Messages.Add(@{ Message = "=== REMOVABLE DISKS ==="; EntryType = "Cyan" })
+    
+    # Вариант 1: Логические диски
+    [void]$Messages.Add(@{ Message = "Logical USB-disks"; EntryType = "Information" })
+    $UsbDrives = Get-WmiObject -Class Win32_Volume | Where-Object { $_.DriveType -eq 2 }
     if ($UsbDrives) {
-        $logical = foreach ($Drive in $UsbDrives) {
-            New-Object PSObject -Property @{
-                "Disk letter" = $Drive.DriveLetter
-                "Tome"        = $Drive.Label
-                "Filesystem"  = $Drive.FileSystem
-                "Free (GB)"   = [Math]::Round($Drive.FreeSpace / 1GB, 2)
-                "All (GB)"    = [Math]::Round($Drive.Capacity / 1GB, 2)
-            } 
+        if ($On) {
+            $RawUsbDrives = $UsbDrives | Select-Object -Property * | Format-List | Out-String -Width 4096
+            [void]$Messages.Add(@{ Message = $RawUsbDrives; EntryType = "Information" })
         }
-        $Logical | Format-Table -AutoSize | Out-Host
+        else {
+            $Logical = foreach ($Drive in $UsbDrives) {
+                New-Object PSObject -Property @{
+                    "Disk letter" = $Drive.DriveLetter
+                    "Tome"        = $Drive.Label
+                    "Filesystem"  = $Drive.FileSystem
+                    "Free (GB)"   = [Math]::Round($Drive.FreeSpace / 1GB, 2)
+                    "All (GB)"    = [Math]::Round($Drive.Capacity / 1GB, 2)
+                } 
+            }
+            $FormattedLogical = $Logical | Format-Table -AutoSize | Out-String -Width 4096
+            [void]$Messages.Add(@{ Message = $FormattedLogical; EntryType = "Information" })
+        }
     }
     else {
-        Write-Log "Active flash volumes not found" -ForegroundColor Gray
+        [void]$Messages.Add(@{ Message = "Active flash volumes not found"; EntryType = "Gray" })
     }
 
     # Вариант 2 - Физические USB-накопители
-    Write-Log "Physical USB-Drives" "Warning"
+    [void]$Messages.Add(@{ Message = "Physical USB-Drives"; EntryType = "Warning" })
     $UsbDiskDrives = Get-WmiObject -Class Win32_DiskDrive | Where-Object { $_.InterfaceType -eq "USB" }
     if ($UsbDiskDrives) {
-        $UsbDiskDrives | Format-Table Model, Size, DeviceID -AutoSize
+        if ($On) {
+            $RawUsbDisks = $UsbDiskDrives | Select-Object -Property * | Format-List | Out-String -Width 4096
+            [void]$Messages.Add(@{ Message = $RawUsbDisks; EntryType = "Information" })
+        }
+        else {
+            $FormattedPhysical = $UsbDiskDrives | Format-Table Model, Size, DeviceID -AutoSize | Out-String -Width 4096
+            [void]$Messages.Add(@{ Message = $FormattedPhysical; EntryType = "Information" })
+        }
     }
     else {
-        Write-Host "Physical USB-Disks not found" -ForegroundColor Gray
+        [void]$Messages.Add(@{ Message = "Physical USB-Disks not found"; EntryType = "Gray" })
+    }
+
+    return [PSCustomObject]@{
+        Index    = $TaskIndex
+        Messages = $Messages
     }
 }
 
 
 # Функция поиска требуемых программ
 function SeekObjects {
-    Write-Host "`n "
-    Write-Log "=== SYSTEM SCANNER STARTINIG ===" "Cyan"
-    
-    # Теперь запускаем алгоритм массового сканирования реестра на присутствие программ
+    param (
+        [switch]$On,
+        [int]$TaskIndex = 0
+    )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n "; EntryType = "Information" })
+    [void]$Messages.Add(@{ Message = "=== SYSTEM SCANNER STARTINIG ==="; EntryType = "Cyan" })
+
     $RegPaths = @(
         "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
-    
-    # It calls all the objects which has any name
     $Programs = Get-ItemProperty $RegPaths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName }
-    
-    # Запрашиваем данные через Get-WmiObject (C(i)mInstance НЕ используется согласно ТЗ)
-    # Это позволит вытащить IdentifyingNumber (серийный ID продукта MSI)
+
+    # ВНИМАНИЕ: Win32_Product очень медленный (перезапускает MSI для каждого продукта).
+    # Если хотите ускорить SeekObjects на порядок — закомментируйте эту строку
+    # и берите IdentifyingNumber только из реестра ($Program.ProductID).
     $WmiProducts = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue
 
     $Result = New-Object System.Collections.ArrayList
@@ -434,41 +662,28 @@ function SeekObjects {
         $Name = $Program.DisplayName
         $RawDate = $Program.InstallDate
         $CleanDate = $RawDate
-
         if ($RawDate -and $RawDate -match '^\d{8}$') {
-            try {
-                $CleanDate = [datetime]::ParseExact($RawDate, 'yyyyMMdd', $null).ToString('dd.MM.yyyy')
-            } catch {
-                $CleanDate = $RawDate
-            }
+            try { $CleanDate = [datetime]::ParseExact($RawDate, 'yyyyMMdd', $null).ToString('dd.MM.yyyy') }
+            catch { $CleanDate = $RawDate }
         }
 
-        # We'll seek date of first installation by installation directory
         $FinalDate = "Unknown"
         $InstallDir = $Program.InstallLocation
         if ($InstallDir) {
             $FolderInfo = Get-Item -Path $InstallDir -ErrorAction SilentlyContinue
-            if ($FolderInfo) {
-                $FinalDate = $FolderInfo.CreationTime.ToString('dd.MM.yyyy')
-            }
+            if ($FolderInfo) { $FinalDate = $FolderInfo.CreationTime.ToString('dd.MM.yyyy') }
         }
 
-        # Поиск серийного номера / идентификатора продукта
-        # 1. Проверяем реестровый DigitalProductId или SerialNumber (если вендор их туда записал)
         $SerialNumber = "Unknown"
         if ($Program.DigitalProductId) { $SerialNumber = "Has Digital ID" }
         elseif ($Program.SerialNumber) { $SerialNumber = $Program.SerialNumber }
-        elseif ($Program.ProductID) { $SerialNumber = $Program.ProductID }
-        
-        # 2. Если в реестре пусто, ищем совпадение по имени в Get-WmiObject
+        elseif ($Program.ProductID)    { $SerialNumber = $Program.ProductID }
+
         if ($SerialNumber -eq "Unknown" -and $WmiProducts) {
             $WmiMatch = $WmiProducts | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
-            if ($WmiMatch -and $WmiMatch.IdentifyingNumber) {
-                $SerialNumber = $WmiMatch.IdentifyingNumber
-            }
+            if ($WmiMatch -and $WmiMatch.IdentifyingNumber) { $SerialNumber = $WmiMatch.IdentifyingNumber }
         }
 
-        # Format output data as table
         $Result += New-Object PSObject -Property @{
             "Program"           = $Name
             "Version"           = $Program.DisplayVersion
@@ -479,7 +694,12 @@ function SeekObjects {
         }
     }
 
-    $Result | Format-Table -Property "Program", "Version", "Manufacturer", "Installation Date", "Update Date", "Serial / ProdID" -AutoSize | Out-String -Width 4096
+    $Table = $Result |
+             Format-Table -Property "Program","Version","Manufacturer","Installation Date","Update Date","Serial / ProdID" -AutoSize |
+             Out-String -Width 4096
+    [void]$Messages.Add(@{ Message = $Table; EntryType = "Information" })
+
+    return [PSCustomObject]@{ Index = $TaskIndex; Messages = $Messages }
 }
 
 # Функция, запрашивающая лицензию Винды
@@ -497,25 +717,36 @@ function Get-WindowsLicense {
 
 # Функция проверки и в крайнем случае установки лицензий на офис и винду
 function WindowsOfficeCheck {
-    Write-Log "=== START ALGORITHM OF CHECKING OFFICE AND WINDOWS ===" "Cyan"
-    Write-Log "=== Checking Windows activation ==="
+    param (
+        [switch]$On,
+        [int]$TaskIndex = 0
+    )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "=== START ALGORITHM OF CHECKING OFFICE AND WINDOWS ==="; EntryType = "Cyan" })
+    [void]$Messages.Add(@{ Message = "=== Checking Windows activation ==="; EntryType = "Information" })
+
     $License = Get-WindowsLicense
-
     if ($null -ne $License -and $License.LicenseStatus -eq 1) {
-        Write-Log "[GOOD] Windows is already activated (Status: Licensed)" "Good"
+        [void]$Messages.Add(@{ Message = "[GOOD] Windows is already activated (Status: Licensed)"; EntryType = "Good" })
+    } else {
+        [void]$Messages.Add(@{ Message = "[BAD] Windows is NOT activated."; EntryType = "Error" })
     }
-    else {
-        Write-Log "[BAD] Windows is NOT activated." "Error"
-    }
 
-    Write-Log "Windows version"
-    Get-WmiObject -Class Win32_OperatingSystem | Select Caption, Version, BuildNmber | Format-List
-    Write-log "Office version"
-    Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object {$_.DisplayName -like "*Office*"} | Select-Object DisplayName, DisplayVersion | Format-List
+    [void]$Messages.Add(@{ Message = "Windows version"; EntryType = "Information" })
+    $WinVer = Get-WmiObject -Class Win32_OperatingSystem |
+              Select-Object Caption, Version, BuildNumber |
+              Format-List | Out-String -Width 4096
+    [void]$Messages.Add(@{ Message = $WinVer; EntryType = "Information" })
 
+    [void]$Messages.Add(@{ Message = "Office version"; EntryType = "Information" })
+    $OfficeVer = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
+                 Where-Object { $_.DisplayName -like "*Office*" } |
+                 Select-Object DisplayName, DisplayVersion |
+                 Format-List | Out-String -Width 4096
+    [void]$Messages.Add(@{ Message = $OfficeVer; EntryType = "Information" })
 
-    # --- Office Activation Check ---
-    Write-Log "`n=== Checking Office Licenses ===" "Warning"
+    [void]$Messages.Add(@{ Message = "`n=== Checking Office Licenses ==="; EntryType = "Warning" })
 
     $OfficeLicense = Get-WmiObject -Class SoftwareLicensingProduct `
         -Filter "Name LIKE '%Office%' AND LicenseStatus = 1 AND PartialProductKey IS NOT NULL" |
@@ -523,199 +754,139 @@ function WindowsOfficeCheck {
         Select-Object -First 1
 
     if ($OfficeLicense) {
-        Write-Log "[GOOD] Office is activated (Licensed)" "Good"
-        Write-Log "License: $OfficeLicense"
+        [void]$Messages.Add(@{ Message = "[GOOD] Office is activated (Licensed)"; EntryType = "Good" })
+        [void]$Messages.Add(@{ Message = "License: $OfficeLicense"; EntryType = "Information" })
+    } else {
+        [void]$Messages.Add(@{ Message = "[BAD] Office is NOT activated."; EntryType = "Error" })
     }
-    else {
-        Write-Log "[BAD] Office is NOT activated." "Error"
-    }
+
+    return [PSCustomObject]@{ Index = $TaskIndex; Messages = $Messages }
 }
 
 function ViPNeTSeek {
-    Write-Log "=== VIPNET SEEKING MODULE STARTED" "Cyan"
-    # Lets check for vipnet at common programms
-    
-    $Pattern = 'ViPNet|Infotecs|Crypto-Pro|Security-Lab'
+    param (
+        [switch]$On,
+        [int]$TaskIndex = 0
+    )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    $Pattern        = 'ViPNet|Infotecs|Crypto-Pro|Security-Lab'
     $ProcessPattern = 'ViPNet|Infotecs|Coordinator|CryptoPRO|Crypto-Pro'
-    
-    # Seek in registry
-    Write-Log "Seeking for ViPNeT in registry"
+
+    [void]$Messages.Add(@{ Message = "=== VIPNET SEEKING MODULE STARTED"; EntryType = "Cyan" })
+
+    # Registry
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNeT in registry"; EntryType = "Information" })
     $UninstallPaths = @(
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     foreach ($Path in $UninstallPaths) {
-        Get-ItemProperty $Path -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.DisplayName -and
-                $_.DisplayName -match $Pattern
-            } |
-            Select-Object DisplayName,
-                DisplayVersion,
-                Publisher,
-                InstallDate,
-                InstallLocation,
-                UninstallString,
-                QuietUninstallString |
-            Format-List
+        $RegHits = Get-ItemProperty $Path -ErrorAction SilentlyContinue |
+                   Where-Object { $_.DisplayName -and $_.DisplayName -match $Pattern } |
+                   Select-Object DisplayName, DisplayVersion, Publisher, InstallDate,
+                                 InstallLocation, UninstallString, QuietUninstallString |
+                   Format-List | Out-String -Width 4096
+        if ($RegHits.Trim()) { [void]$Messages.Add(@{ Message = $RegHits; EntryType = "Information" }) }
     }
 
-    # Seek ViPNeT in services (в службах)
-    Write-Log "Seeking for ViPNet in services"
-    
-    Get-WmiObject Win32_Service `
-        -Filter "Name LIKE '%ViPNet%' OR Name LIKE '%Infotecs%' OR DisplayName '%ViPNet%' OR DisplayName LIKE '%Infotecs%'" `
+    # Services
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in services"; EntryType = "Information" })
+    $SvcHits = Get-WmiObject Win32_Service `
+        -Filter "Name LIKE '%ViPNet%' OR Name LIKE '%Infotecs%' OR DisplayName LIKE '%ViPNet%' OR DisplayName LIKE '%Infotecs%'" `
         -ErrorAction SilentlyContinue |
-        Select-Object Name,
-                     DisplayName,
-                     State,
-                     StartMode,
-                     StartName,
-                     PathName |
-        Format-List
+        Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+        Format-List | Out-String -Width 4096
+    if ($SvcHits.Trim()) { [void]$Messages.Add(@{ Message = $SvcHits; EntryType = "Information" }) }
 
-    # Seek ViPNeT in processes
-    Write-Log "Seeking for ViPNet in processes"
+    # Processes  (здесь был баг: $VipnetProc vs $VipnetProcesses)
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in processes"; EntryType = "Information" })
+    $VipnetProcesses = @(Get-Process -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match $ProcessPattern })
 
-    $VipnetProc = @(
-        Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { 
-                $_.Name -match $ProcessPattern
-            } 
-    )
     if ($VipnetProcesses.Count -gt 0) {
-        $VipnetProcesses |
-            Select-Object Name,
-                          Id,
-                          Path,
-                          Company,
-                          ProductVersion,
-                          StartTime |
-            Format-List
-    }
+        $ProcHits = $VipnetProcesses |
+            Select-Object Name, Id, Path, Company, ProductVersion, StartTime |
+            Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $ProcHits; EntryType = "Information" })
 
-    # Network
-    if ($VipnetProcesses.Count -gt 0) {
-        Write-Log "Seeking for ViPNet TCP/UDP connections"
-        # Hashtable значительно быстрее, чем
-        # $ProcessIds -contains $Pid при большом количестве соединений.
+        # Network
+        [void]$Messages.Add(@{ Message = "Seeking for ViPNet TCP/UDP connections"; EntryType = "Information" })
         $ProcessIdMap = @{}
-        foreach ($Process in $VipnetProcesses) {
-            $ProcessIdMap[[int]$Process.Id] = $true
-        }
-        netstat -ano 2>$null |
-            ForEach-Object {
-                $Line = $_.Trim()
-                if ($Line -match '^(TCP|UDP)\s+(\S+)\s+(\S+)(?:\s+(\S+))?\s+(\d+)$') {
-                    $Protocol       = $Matches[1]
-                    $LocalAddress   = $Matches[2]
-                    $ForeignAddress = $Matches[3]
-                    $State          = $Matches[4]
-                    $PidFound       = [int]$Matches[5]
-                    if ($ProcessIdMap.ContainsKey($PidFound)) {
-                        New-Object PSObject -Property @{
-                            Protocol       = $Protocol
-                            LocalAddress   = $LocalAddress
-                            ForeignAddress = $ForeignAddress
-                            State          = if ($Protocol -eq 'UDP') {
-                                'N/A'
-                            }
-                            else {
-                                $State
-                            }
-                            OwningProcess  = $PidFound
-                        }
+        foreach ($Process in $VipnetProcesses) { $ProcessIdMap[[int]$Process.Id] = $true }
+        $NetHits = netstat -ano 2>$null | ForEach-Object {
+            $Line = $_.Trim()
+            if ($Line -match '^(TCP|UDP)\s+(\S+)\s+(\S+)(?:\s+(\S+))?\s+(\d+)$') {
+                $PidFound = [int]$Matches[5]
+                if ($ProcessIdMap.ContainsKey($PidFound)) {
+                    New-Object PSObject -Property @{
+                        Protocol       = $Matches[1]
+                        LocalAddress   = $Matches[2]
+                        ForeignAddress = $Matches[3]
+                        State          = if ($Matches[1] -eq 'UDP') { 'N/A' } else { $Matches[4] }
+                        OwningProcess  = $PidFound
                     }
                 }
-            } |
-            Format-List
-    }
-
-    # Seek in file system
-    Write-Log "Seeking for ViPNet in file system"
-    $MaxDepth = 2
-    $Roots = @(
-        "$env:ProgramFiles",
-        "${env:ProgramFiles(x86)}",
-        "$env:ProgramData",
-        "$env:LOCALAPPDATA",
-        "$env:APPDATA"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    $Roots = $Roots | Where-Object {
-        $_ -and (Test-Path $_ -ErrorAction SilentlyContinue)
-    } | Select-Object -Unique
-
-    $PercentInt = 0
-    $TotalRoots = $Roots.Count
-
-    foreach ($Root in $Roots) {
-        Get-ChildItem $Root `
-            -Directory `
-            -Recurse `
-            -Depth $MaxDepth `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -match $Pattern
-            } |
-            Select-Object FullName,
-                          CreationTime,
-                          LastWriteTime |
-            Format-List
-        $Percent = [math]::Round(($PercentInt / $TotalRoots) * 100)
-        $PercentInt++
-    }
-
-    # Firewall scan
-    Write-Log "Seeking for ViPNet in firewall rules"
-    $RuleTect = netsh advfirewall firewall show rule name=all 2>$null
-    $CurrentRule = $null
-
-    foreach ($Line in $RuleText) {
-        if ($Line -match '^(Rule Name|Имя правила)\s*:\s*(.+$') {
-            $CurrentRule = $Matches[2].Trim()
-            if ($CurrentRule -match $Pattern) {
-                New-Object PSObject -Property @{
-                    DisplayName = $CurrentRule
-                }
             }
+        } | Format-List | Out-String -Width 4096
+        if ($NetHits.Trim()) { [void]$Messages.Add(@{ Message = $NetHits; EntryType = "Information" }) }
+    }
+
+    # File system
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in file system"; EntryType = "Information" })
+    $MaxDepth = 2
+    $Roots = @("$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:ProgramData", "$env:LOCALAPPDATA", "$env:APPDATA") |
+             Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+    $FsHits = foreach ($Root in $Roots) {
+        Get-ChildItem $Root -Directory -Recurse -Depth $MaxDepth -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $Pattern } |
+            Select-Object FullName, CreationTime, LastWriteTime
+    }
+    if ($FsHits) {
+        $FsStr = $FsHits | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $FsStr; EntryType = "Information" })
+    }
+
+    # Firewall  (здесь был баг: $RuleTect vs $RuleText)
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in firewall rules"; EntryType = "Information" })
+    $RuleText = netsh advfirewall firewall show rule name=all 2>$null
+    $FwHits = foreach ($Line in $RuleText) {
+        if ($Line -match '^(Rule Name|Имя правила)\s*:\s*(.+)$') {
+            $CurrentRule = $Matches[2].Trim()
+            if ($CurrentRule -match $Pattern) { [PSCustomObject]@{ DisplayName = $CurrentRule } }
         }
-    } 
+    }
+    if ($FwHits) {
+        $FwStr = $FwHits | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $FwStr; EntryType = "Information" })
+    }
 
     # Certificates
-    Write-Log "Seeking for ViPNet certificates"
-
-    $CertificateStores = @(
-        'Cert:\LocalMachine\My',
-        'Cert:\CurrentUser\My'
-    )
-
-    foreach ($Store in $CertificateStores) {
-
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet certificates"; EntryType = "Information" })
+    $CertHits = foreach ($Store in @('Cert:\LocalMachine\My','Cert:\CurrentUser\My')) {
         Get-ChildItem $Store -ErrorAction SilentlyContinue |
             Where-Object {
-
                 ($_.Subject -and $_.Subject -match $Pattern) -or
-                ($_.Issuer -and $_.Issuer -match $Pattern) -or
-                ($_.EnhancedKeyUsageList -and
-                    $_.EnhancedKeyUsageList.FriendlyName -match $Pattern)
-
+                ($_.Issuer  -and $_.Issuer  -match $Pattern) -or
+                ($_.EnhancedKeyUsageList -and $_.EnhancedKeyUsageList.FriendlyName -match $Pattern)
             } |
-            Select-Object PSParentPath,
-                          Subject,
-                          Issuer,
-                          Thumbprint,
-                          NotBefore,
-                          NotAfter,
-                          HasPrivateKey,
-                          SerialNumber |
-            Format-List
+            Select-Object PSParentPath, Subject, Issuer, Thumbprint, NotBefore, NotAfter, HasPrivateKey, SerialNumber
+    }
+    if ($CertHits) {
+        $CertStr = $CertHits | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $CertStr; EntryType = "Information" })
     }
 
     # Crypto providers
-    Write-Log "Seeking for ViPNet cryptographic providers"
-    certutil -csplist 2>$null
-    Write-Log "=== VIPNET SEEKING MODULE FINISHED" "Cyan"
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet cryptographic providers"; EntryType = "Information" })
+    $Csp = certutil -csplist 2>$null | Out-String -Width 4096
+    if ($Csp.Trim()) { [void]$Messages.Add(@{ Message = $Csp; EntryType = "Information" }) }
+
+    [void]$Messages.Add(@{ Message = "=== VIPNET SEEKING MODULE FINISHED"; EntryType = "Cyan" })
+
+    return [PSCustomObject]@{ Index = $TaskIndex; Messages = $Messages }
 }
 
 # ================================================================================
@@ -774,20 +945,46 @@ Add-Content -Path "$env:TEMP\log.txt" -Value "We hope code is hidden"
 # =========================================================================
 # БЛОК 1: ОПРЕДЕЛЕНИЕ ИМЕНИ ПК И ПОИСК ФЛЕШКИ
 # =========================================================================
+Write-Log "PSChecker version: 6"
 $ComputerName = $env:COMPUTERNAME
 $BiosInfo = Get-WmiObject -Class Win32_BIOS -ErrorAction SilentlyContinue
 if ($BiosInfo -and $BiosInfo.PSComputerName) { $ComputerName = $BiosInfo.PSComputerName }
+
+# Текущее время и прочая хуйня
+$localTime = Get-Date -Format "HHmmss"
+try {
+    $webCli = New-Object System.Net.WebClient
+    $WebReq = $webCli.Downloadstring("http://worldtimeapi.org")
+    if ($WebReq -match '"utc_datetime":"([^"]+)"') {
+        $worldTime = [DateTime]$matches[1]
+        $networkStatus = "Synchronized through network"
+    }
+    else {
+        throw "Haven't got world time"
+        $worldTime = "NO"
+    }
+}
+catch {
+    $worldTime = "NO"
+    $networkStatus = "No network / NetError"
+    Write-Log "No network or we have no connection $_"
+}
+if ($worldTime -ne "NO"){
+    Write-Log "WORLD TIME RIGHT NOW: $worldTime" "Cyan"
+    Write-Log "LOCAL TIME RIGTH NOW: $localTime" "Cyan"
+} 
+
 
 # Поиск флешки
 $UsbDrive = Get-WmiObject -Class Win32_LogicalDisk -Filter "DriveType = 2" | Select-Object -First 1
 
 if ($UsbDrive -and $UsbDrive.DeviceID) {
     # Безопасное объединение: DeviceID (например, "E:") + имя файла
-    $LogPath = Join-Path -Path $UsbDrive.DeviceID -ChildPath "${ComputerName}_scanner_log.txt"
+    $LogPath = Join-Path -Path $UsbDrive.DeviceID -ChildPath "${ComputerName}_${localTime}_log.txt"
 }
 else {
     # Добавлен пропущенный слэш перед именем файла
-    $LogPath = Join-Path -Path "$home\Desktop" -ChildPath "${ComputerName}_scanner_log.txt"
+    $LogPath = Join-Path -Path "$home\Desktop" -ChildPath "${ComputerName}_${localTime}_log.txt"
 }
 
 # Включаем запись терминала в файл
@@ -828,62 +1025,52 @@ else {
 
 
 
+# Режим вывода
+$UseFullOutput = $false
 
-
-# Запускаем проверщик винды и офиса.
-WindowsOfficeCheck
-# Берём IP-адресс устройства
-IpAdressGet 
-# Берём инфу с сетевой карты
-NetAdapterGet
-# Берём инфу с процессора
-CPUGet
-# Берём инфу с видеокарты
-VRAMGet
-# Берём инфу с оперативной памяти
-RAMGet 
-# Берём инфу с дисков
-DiskGet
-# Обращаемся к Биосу чтобы вывести информацию о нем и о системе
-BIOSGet
-# Сканируем на наличие мониторов
-MonitorGet
-# Получаем всю инфу о подключённой периферии
-PeripheralGet
-
-Write-Log "Check does deep inspection is required..."
-while ($true) {
-    $choice = "y"
-    #$choice = Read-Host "You wanna get more data about PC? (y/n)..."
-    if ($choice -eq 'y') {
-        # The same one but without choosing what it have to print
-        IpAdressGet -On
-        NetAdapterGet -On
-        CPUGet -On
-        VRAMGet -On
-        RAMGet -On
-        DiskGet -On
-        BIOSGet -On
-        MonitorGet -On
-        PeripheralGet -On
-        break
-    }
-    break
+if ($Hidden -or -not [Environment]::UserInteractive) {
+    $UseFullOutput = $true
+    Write-Log "=== HIDDEN/HEADLESS MODE: full out enabled automatically ===" "Cyan"
 }
-
-#Запускаем поисковик программ
-Write-Log "Seeker mode"
-while ($true) {
-    $choice = 'y'
-    #$choice = Read-Host "We will scan PC on programs? (y/n)"
-    if ($choice -eq 'y') {
-        Write-Log "Scanning all programs..." "Cyan"
-        SeekObjects
-        Write-Log "Scanning for ViPNeT..." "Cyan"
-        ViPNeTSeek
-        break
+else {
+    $answer = Read-Host "Extended scan of system? (y/n)"
+    if ($answer -match '^(y|yes|д|да)$') {
+        $UseFullOutput = $true
+        Write-Log "=== FULL output is On ===" "Cyan"
     }
-    break
+    else {
+        $UseFullOutput = $false
+        Write-Log "=== SUMMARY output is On ===" "Cyan"
+    }
+}
+# Определение задач по порядку вывода
+# OutputIndex — порядок вывода
+# LaunchWeight — приоритет запуска (тяжёлые раньше)
+$TaskBlocks = @(
+    [PSCustomObject]@{ Name='WindowsOfficeCheck'; LaunchWeight=30;  OutputIndex=0;  Block={ param($o,$f) WindowsOfficeCheck -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='IpAdressGet';        LaunchWeight=5;   OutputIndex=1;  Block={ param($o,$f) IpAdressGet        -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='NetAdapterGet';      LaunchWeight=5;   OutputIndex=2;  Block={ param($o,$f) NetAdapterGet      -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='CPUGet';             LaunchWeight=10;  OutputIndex=3;  Block={ param($o,$f) CPUGet             -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='VRAMGet';            LaunchWeight=10;  OutputIndex=4;  Block={ param($o,$f) VRAMGet            -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='RAMGet';             LaunchWeight=10;  OutputIndex=5;  Block={ param($o,$f) RAMGet             -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='DiskGet';            LaunchWeight=70;  OutputIndex=6;  Block={ param($o,$f) DiskGet            -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='BIOSGet';            LaunchWeight=90;  OutputIndex=7;  Block={ param($o,$f) BIOSGet            -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='MonitorGet';         LaunchWeight=15;  OutputIndex=8;  Block={ param($o,$f) MonitorGet         -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='PeripheralGet';      LaunchWeight=40;  OutputIndex=9;  Block={ param($o,$f) PeripheralGet      -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='SeekObjects';        LaunchWeight=100; OutputIndex=10; Block={ param($o,$f) SeekObjects        -TaskIndex $o -On:$f } }
+    [PSCustomObject]@{ Name='ViPNeTSeek';         LaunchWeight=95;  OutputIndex=11; Block={ param($o,$f) ViPNeTSeek         -TaskIndex $o -On:$f } }
+)
+
+Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount), FullOutput = $UseFullOutput) ===" "Cyan"
+$Results = Invoke-ParallelWithOrder `
+    -ScriptBlocks $TaskBlocks `
+    -UseFullOutput $UseFullOutput `
+    -ProgressCallback { param($m) Write-Log $m "Progress" }
+
+foreach($Result in ($Results | Sort-Object Index)) {
+    foreach ($Msg in $Result.Messages) {
+        Write-log $Msg.Message $Msg.EntryType
+    }
 }
 
 while ($true) {
