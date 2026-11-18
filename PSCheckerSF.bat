@@ -997,19 +997,19 @@ else {
 # Режим вывода
 $UseFullOutput = $false
 
-if ($Hidden) {
+if ($Hidden -or -not [Environment]::UserInteractive) {
     $UseFullOutput = $true
-    Write-Log "=== HIDDEN MODE: full output (-On) enabled automatically ===" "Cyan"
+    Write-Log "=== HIDDEN/HEADLESS MODE: full out enabled automatically ===" "Cyan"
 }
 else {
-    $answer = Read-Host "Get extended (-On) data for all subsystems? This significantly increases output size (y/n)"
+    $answer = Read-Host "Extended scan of system? (y/n)"
     if ($answer -match '^(y|yes|д|да)$') {
         $UseFullOutput = $true
-        Write-Log "=== User chose FULL output (-On) ===" "Cyan"
+        Write-Log "=== FULL output is On ===" "Cyan"
     }
     else {
         $UseFullOutput = $false
-        Write-Log "=== User chose SUMMARY output (-On disabled) ===" "Cyan"
+        Write-Log "=== SUMMARY output is On ===" "Cyan"
     }
 }
 # Определение задач по порядку вывода
@@ -1032,16 +1032,12 @@ $TaskBlocks = @(
 
 Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount), FullOutput = $UseFullOutput) ===" "Cyan"
 $Results = Invoke-ParallelWithOrder -ScriptBlocks $TaskBlocks -UseFullOutput $UseFullOutput
-Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount)) ===" "Cyan"
-$Results = Invoke-ParallelWithOrder -ScriptBlocks $TaskBlocks
 
 foreach($Result in ($Results | Sort-Object Index)) {
     foreach ($Msg in $Result.Messages) {
         Write-log $Msg.Message $Msg.EntryType
     }
 }
-
-
 
 while ($true) {
     Write-Log "         ." "Cyan"
