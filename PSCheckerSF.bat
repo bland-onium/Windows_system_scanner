@@ -37,13 +37,16 @@ function Write-Log {
     )
         
     # 1. Определяем цвет для консоли на основе переданного EntryType
-    if ($EntryType -eq "Good") { $Color = "Green" }
-    elseif ($EntryType -eq "Error") { $Color = "Red" }
-    elseif ($EntryType -eq "Warning") { $Color = "Yellow" }
-    elseif ($EntryType -eq "Cyan") { $Color = "Cyan" }
-    else { $Color = "White" }
+    if ($EntryType -eq "Good")          { $Color = "Green" }
+    elseif ($EntryType -eq "Error")     { $Color = "Red" }
+    elseif ($EntryType -eq "Warning")   { $Color = "Yellow" }
+    elseif ($EntryType -eq "Cyan")      { $Color = "Cyan" }
+    elseif ($EntryType -eq "Progress")  { $Color = "DarkGray" }
+    else                                { $Color = "White" }
         
     Write-Host $Message -ForegroundColor $Color
+
+    if ($EntryType -eq "Progress") {return}
     
     if ($script:hidden){
         # 2. Приводим EntryType к валидному системному типу для Event Log.
@@ -78,10 +81,13 @@ function Invoke-ParallelWithOrder {
         [Parameter(Mandatory=$true)]
         [array]$ScriptBlocks,
         [int]$ThrottleLimit = [Environment]::ProcessorCount,
-        [bool]$UseFullOutput = $false        # <-- новый параметр
+        [bool]$UseFullOutput = $false,
+        [scriptblock]$ProgressCallback = { param($m) Write-Host $m -ForegroundColor DarkGray },
+        [int]$PollIntervalMs = 200
     )
 
-    $ExcludeFunctions = @('Invoke-ParallelWithOrder', 'prompt', 'TabExpansion2', 'TabExpansion')
+    # --- ISS с функциями (как раньше) ---
+    $ExcludeFunctions = @('Invoke-ParallelWithOrder','prompt','TabExpansion2','TabExpansion')
     $ISS = [System.Management.Automation.Runspaces.InitialSessionState]::CreateDefault()
     Get-ChildItem Function:\ | Where-Object { $ExcludeFunctions -notcontains $_.Name } | ForEach-Object {
         try {
@@ -98,20 +104,42 @@ function Invoke-ParallelWithOrder {
 
     $LaunchOrder = $ScriptBlocks | Sort-Object LaunchWeight -Descending
 
+    # --- Запуск ---
     $Jobs = @()
     foreach ($Task in $LaunchOrder) {
         $PS = [powershell]::Create()
         $PS.RunspacePool = $Pool
-        # ВТОРОЙ аргумент — флаг -On
         [void]$PS.AddScript($Task.Block.ToString()).AddArgument($Task.OutputIndex).AddArgument($UseFullOutput)
         $Jobs += [PSCustomObject]@{
             OutputIndex = $Task.OutputIndex
             Name        = $Task.Name
             PS          = $PS
             Handle      = $PS.BeginInvoke()
+            Completed   = $false
         }
     }
 
+    $Total     = $Jobs.Count
+    $Completed = 0
+    $StartAt   = Get-Date
+
+    & $ProgressCallback "=== $Total task(s) launched, waiting for completion... ==="
+
+    # --- Polling-цикл: печатаем статус по мере готовности ---
+    while ($Completed -lt $Total) {
+        foreach ($Job in $Jobs) {
+            if (-not $Job.Completed -and $Job.Handle.IsCompleted) {
+                $Job.Completed = $true
+                $Completed++
+                $Elapsed = [math]::Round(((Get-Date) - $StartAt).TotalSeconds, 1)
+                & $ProgressCallback ("[{0}/{1}] {2} (Index={3}) finished in {4}s" -f `
+                    $Completed, $Total, $Job.Name, $Job.OutputIndex, $Elapsed)
+            }
+        }
+        Start-Sleep -Milliseconds $PollIntervalMs
+    }
+
+    # --- Сбор результатов: всё уже готово, EndInvoke мгновенный ---
     $Results = foreach ($Job in $Jobs) {
         $outObj = $null
         try {
@@ -147,6 +175,9 @@ function Invoke-ParallelWithOrder {
 
     $Pool.Close()
     $Pool.Dispose()
+
+    $TotalElapsed = [math]::Round(((Get-Date) - $StartAt).TotalSeconds, 1)
+    & $ProgressCallback "=== All $Total task(s) finished in ${TotalElapsed}s ==="
 
     return ($Results | Sort-Object Index)
 }
@@ -1031,7 +1062,10 @@ $TaskBlocks = @(
 )
 
 Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount), FullOutput = $UseFullOutput) ===" "Cyan"
-$Results = Invoke-ParallelWithOrder -ScriptBlocks $TaskBlocks -UseFullOutput $UseFullOutput
+$Results = Invoke-ParallelWithOrder `
+    -ScriptBlocks $TaskBlocks `
+    -UseFullOutput $UseFullOutput `
+    -ProgressCallback { param($m) Write-Log $m "Progress" }
 
 foreach($Result in ($Results | Sort-Object Index)) {
     foreach ($Msg in $Result.Messages) {
