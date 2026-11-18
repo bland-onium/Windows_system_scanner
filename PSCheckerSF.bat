@@ -76,19 +76,18 @@ function Write-Log {
 function Invoke-ParallelWithOrder {
     param(
         [Parameter(Mandatory=$true)]
-        [array]$ScriptBlocks,
+        [array]$ScriptBlocks,                                        # <-- имя параметра
         [int]$ThrottleLimit = [Environment]::ProcessorCount
     )
 
     $Pool = [runspacefactory]::CreateRunspacePool(1, $ThrottleLimit)
     $Pool.Open()
 
-    # КЛЮЧЕВОЕ: сортируем по весу убыванию ТОЛЬКО для постановки в очередь пула
-    $LaunchOrder = $Tasks | Sort-Object LaunchWeight -Descending
+    # КЛЮЧЕВОЕ: $ScriptBlocks (а не $Tasks)
+    $LaunchOrder = $ScriptBlocks | Sort-Object LaunchWeight -Descending
 
     $Jobs = @()
     foreach ($Task in $LaunchOrder) {
-        # В скриптблок уходит OutputIndex, а не LaunchWeight и не позиция в очереди
         $PS = [powershell]::Create().AddScript($Task.Block).AddArgument($Task.OutputIndex)
         $PS.RunspacePool = $Pool
         $Jobs += [PSCustomObject]@{
@@ -118,7 +117,6 @@ function Invoke-ParallelWithOrder {
     $Pool.Close()
     $Pool.Dispose()
 
-    # Финальная сортировка по OutputIndex — порядок вывода как в исходнике
     return ($Results | Sort-Object Index)
 }
 
@@ -576,20 +574,24 @@ function PeripheralGet {
 
 # Функция поиска требуемых программ
 function SeekObjects {
-    Write-Host "`n "
-    Write-Log "=== SYSTEM SCANNER STARTINIG ===" "Cyan"
-    
-    # Теперь запускаем алгоритм массового сканирования реестра на присутствие программ
+    param (
+        [switch]$On,
+        [int]$TaskIndex = 0
+    )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "`n "; EntryType = "Information" })
+    [void]$Messages.Add(@{ Message = "=== SYSTEM SCANNER STARTINIG ==="; EntryType = "Cyan" })
+
     $RegPaths = @(
         "HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*",
         "HKLM:\Software\Wow6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*"
     )
-    
-    # It calls all the objects which has any name
     $Programs = Get-ItemProperty $RegPaths -ErrorAction SilentlyContinue | Where-Object { $_.DisplayName }
-    
-    # Запрашиваем данные через Get-WmiObject (C(i)mInstance НЕ используется согласно ТЗ)
-    # Это позволит вытащить IdentifyingNumber (серийный ID продукта MSI)
+
+    # ВНИМАНИЕ: Win32_Product очень медленный (перезапускает MSI для каждого продукта).
+    # Если хотите ускорить SeekObjects на порядок — закомментируйте эту строку
+    # и берите IdentifyingNumber только из реестра ($Program.ProductID).
     $WmiProducts = Get-WmiObject -Class Win32_Product -ErrorAction SilentlyContinue
 
     $Result = New-Object System.Collections.ArrayList
@@ -598,41 +600,28 @@ function SeekObjects {
         $Name = $Program.DisplayName
         $RawDate = $Program.InstallDate
         $CleanDate = $RawDate
-
         if ($RawDate -and $RawDate -match '^\d{8}$') {
-            try {
-                $CleanDate = [datetime]::ParseExact($RawDate, 'yyyyMMdd', $null).ToString('dd.MM.yyyy')
-            } catch {
-                $CleanDate = $RawDate
-            }
+            try { $CleanDate = [datetime]::ParseExact($RawDate, 'yyyyMMdd', $null).ToString('dd.MM.yyyy') }
+            catch { $CleanDate = $RawDate }
         }
 
-        # We'll seek date of first installation by installation directory
         $FinalDate = "Unknown"
         $InstallDir = $Program.InstallLocation
         if ($InstallDir) {
             $FolderInfo = Get-Item -Path $InstallDir -ErrorAction SilentlyContinue
-            if ($FolderInfo) {
-                $FinalDate = $FolderInfo.CreationTime.ToString('dd.MM.yyyy')
-            }
+            if ($FolderInfo) { $FinalDate = $FolderInfo.CreationTime.ToString('dd.MM.yyyy') }
         }
 
-        # Поиск серийного номера / идентификатора продукта
-        # 1. Проверяем реестровый DigitalProductId или SerialNumber (если вендор их туда записал)
         $SerialNumber = "Unknown"
         if ($Program.DigitalProductId) { $SerialNumber = "Has Digital ID" }
         elseif ($Program.SerialNumber) { $SerialNumber = $Program.SerialNumber }
-        elseif ($Program.ProductID) { $SerialNumber = $Program.ProductID }
-        
-        # 2. Если в реестре пусто, ищем совпадение по имени в Get-WmiObject
+        elseif ($Program.ProductID)    { $SerialNumber = $Program.ProductID }
+
         if ($SerialNumber -eq "Unknown" -and $WmiProducts) {
             $WmiMatch = $WmiProducts | Where-Object { $_.Name -eq $Name } | Select-Object -First 1
-            if ($WmiMatch -and $WmiMatch.IdentifyingNumber) {
-                $SerialNumber = $WmiMatch.IdentifyingNumber
-            }
+            if ($WmiMatch -and $WmiMatch.IdentifyingNumber) { $SerialNumber = $WmiMatch.IdentifyingNumber }
         }
 
-        # Format output data as table
         $Result += New-Object PSObject -Property @{
             "Program"           = $Name
             "Version"           = $Program.DisplayVersion
@@ -643,7 +632,12 @@ function SeekObjects {
         }
     }
 
-    $Result | Format-Table -Property "Program", "Version", "Manufacturer", "Installation Date", "Update Date", "Serial / ProdID" -AutoSize | Out-String -Width 4096
+    $Table = $Result |
+             Format-Table -Property "Program","Version","Manufacturer","Installation Date","Update Date","Serial / ProdID" -AutoSize |
+             Out-String -Width 4096
+    [void]$Messages.Add(@{ Message = $Table; EntryType = "Information" })
+
+    return [PSCustomObject]@{ Index = $TaskIndex; Messages = $Messages }
 }
 
 # Функция, запрашивающая лицензию Винды
@@ -661,25 +655,36 @@ function Get-WindowsLicense {
 
 # Функция проверки и в крайнем случае установки лицензий на офис и винду
 function WindowsOfficeCheck {
-    Write-Log "=== START ALGORITHM OF CHECKING OFFICE AND WINDOWS ===" "Cyan"
-    Write-Log "=== Checking Windows activation ==="
+    param (
+        [switch]$On,
+        [int]$TaskIndex = 0
+    )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    [void]$Messages.Add(@{ Message = "=== START ALGORITHM OF CHECKING OFFICE AND WINDOWS ==="; EntryType = "Cyan" })
+    [void]$Messages.Add(@{ Message = "=== Checking Windows activation ==="; EntryType = "Information" })
+
     $License = Get-WindowsLicense
-
     if ($null -ne $License -and $License.LicenseStatus -eq 1) {
-        Write-Log "[GOOD] Windows is already activated (Status: Licensed)" "Good"
+        [void]$Messages.Add(@{ Message = "[GOOD] Windows is already activated (Status: Licensed)"; EntryType = "Good" })
+    } else {
+        [void]$Messages.Add(@{ Message = "[BAD] Windows is NOT activated."; EntryType = "Error" })
     }
-    else {
-        Write-Log "[BAD] Windows is NOT activated." "Error"
-    }
 
-    Write-Log "Windows version"
-    Get-WmiObject -Class Win32_OperatingSystem | Select Caption, Version, BuildNmber | Format-List
-    Write-log "Office version"
-    Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* | Where-Object {$_.DisplayName -like "*Office*"} | Select-Object DisplayName, DisplayVersion | Format-List
+    [void]$Messages.Add(@{ Message = "Windows version"; EntryType = "Information" })
+    $WinVer = Get-WmiObject -Class Win32_OperatingSystem |
+              Select-Object Caption, Version, BuildNumber |
+              Format-List | Out-String -Width 4096
+    [void]$Messages.Add(@{ Message = $WinVer; EntryType = "Information" })
 
+    [void]$Messages.Add(@{ Message = "Office version"; EntryType = "Information" })
+    $OfficeVer = Get-ItemProperty HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\* |
+                 Where-Object { $_.DisplayName -like "*Office*" } |
+                 Select-Object DisplayName, DisplayVersion |
+                 Format-List | Out-String -Width 4096
+    [void]$Messages.Add(@{ Message = $OfficeVer; EntryType = "Information" })
 
-    # --- Office Activation Check ---
-    Write-Log "`n=== Checking Office Licenses ===" "Warning"
+    [void]$Messages.Add(@{ Message = "`n=== Checking Office Licenses ==="; EntryType = "Warning" })
 
     $OfficeLicense = Get-WmiObject -Class SoftwareLicensingProduct `
         -Filter "Name LIKE '%Office%' AND LicenseStatus = 1 AND PartialProductKey IS NOT NULL" |
@@ -687,200 +692,139 @@ function WindowsOfficeCheck {
         Select-Object -First 1
 
     if ($OfficeLicense) {
-        Write-Log "[GOOD] Office is activated (Licensed)" "Good"
-        Write-Log "License: $OfficeLicense"
+        [void]$Messages.Add(@{ Message = "[GOOD] Office is activated (Licensed)"; EntryType = "Good" })
+        [void]$Messages.Add(@{ Message = "License: $OfficeLicense"; EntryType = "Information" })
+    } else {
+        [void]$Messages.Add(@{ Message = "[BAD] Office is NOT activated."; EntryType = "Error" })
     }
-    else {
-        Write-Log "[BAD] Office is NOT activated." "Error"
-    }
+
+    return [PSCustomObject]@{ Index = $TaskIndex; Messages = $Messages }
 }
 
 function ViPNeTSeek {
-    Write-Log "=== VIPNET SEEKING MODULE STARTED" "Cyan"
-    # Lets check for vipnet at common programms
-    
-    $Pattern = 'ViPNet|Infotecs|Crypto-Pro|Security-Lab'
+    param (
+        [switch]$On,
+        [int]$TaskIndex = 0
+    )
+    $Messages = [System.Collections.ArrayList]::new()
+
+    $Pattern        = 'ViPNet|Infotecs|Crypto-Pro|Security-Lab'
     $ProcessPattern = 'ViPNet|Infotecs|Coordinator|CryptoPRO|Crypto-Pro'
-    
-    # Seek in registry
-    Write-Log "Seeking for ViPNeT in registry"
+
+    [void]$Messages.Add(@{ Message = "=== VIPNET SEEKING MODULE STARTED"; EntryType = "Cyan" })
+
+    # Registry
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNeT in registry"; EntryType = "Information" })
     $UninstallPaths = @(
         'HKLM:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKLM:\Software\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\*',
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
     foreach ($Path in $UninstallPaths) {
-        Get-ItemProperty $Path -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.DisplayName -and
-                $_.DisplayName -match $Pattern
-            } |
-            Select-Object DisplayName,
-                DisplayVersion,
-                Publisher,
-                InstallDate,
-                InstallLocation,
-                UninstallString,
-                QuietUninstallString |
-            Format-List
+        $RegHits = Get-ItemProperty $Path -ErrorAction SilentlyContinue |
+                   Where-Object { $_.DisplayName -and $_.DisplayName -match $Pattern } |
+                   Select-Object DisplayName, DisplayVersion, Publisher, InstallDate,
+                                 InstallLocation, UninstallString, QuietUninstallString |
+                   Format-List | Out-String -Width 4096
+        if ($RegHits.Trim()) { [void]$Messages.Add(@{ Message = $RegHits; EntryType = "Information" }) }
     }
 
-    # Seek ViPNeT in services (в службах)
-    Write-Log "Seeking for ViPNet in services"
-    
-    Get-WmiObject Win32_Service `
-        -Filter "Name LIKE '%ViPNet%' OR Name LIKE '%Infotecs%' OR DisplayName '%ViPNet%' OR DisplayName LIKE '%Infotecs%'" `
+    # Services
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in services"; EntryType = "Information" })
+    $SvcHits = Get-WmiObject Win32_Service `
+        -Filter "Name LIKE '%ViPNet%' OR Name LIKE '%Infotecs%' OR DisplayName LIKE '%ViPNet%' OR DisplayName LIKE '%Infotecs%'" `
         -ErrorAction SilentlyContinue |
-        Select-Object Name,
-                     DisplayName,
-                     State,
-                     StartMode,
-                     StartName,
-                     PathName |
-        Format-List
+        Select-Object Name, DisplayName, State, StartMode, StartName, PathName |
+        Format-List | Out-String -Width 4096
+    if ($SvcHits.Trim()) { [void]$Messages.Add(@{ Message = $SvcHits; EntryType = "Information" }) }
 
-    # Seek ViPNeT in processes
-    Write-Log "Seeking for ViPNet in processes"
+    # Processes  (здесь был баг: $VipnetProc vs $VipnetProcesses)
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in processes"; EntryType = "Information" })
+    $VipnetProcesses = @(Get-Process -ErrorAction SilentlyContinue |
+                         Where-Object { $_.Name -match $ProcessPattern })
 
-    $VipnetProc = @(
-        Get-Process -ErrorAction SilentlyContinue |
-            Where-Object { 
-                $_.Name -match $ProcessPattern
-            } 
-    )
     if ($VipnetProcesses.Count -gt 0) {
-        $VipnetProcesses |
-            Select-Object Name,
-                          Id,
-                          Path,
-                          Company,
-                          ProductVersion,
-                          StartTime |
-            Format-List
-    }
+        $ProcHits = $VipnetProcesses |
+            Select-Object Name, Id, Path, Company, ProductVersion, StartTime |
+            Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $ProcHits; EntryType = "Information" })
 
-    # Network
-    if ($VipnetProcesses.Count -gt 0) {
-        Write-Log "Seeking for ViPNet TCP/UDP connections"
-        # Hashtable значительно быстрее, чем
-        # $ProcessIds -contains $Pid при большом количестве соединений.
+        # Network
+        [void]$Messages.Add(@{ Message = "Seeking for ViPNet TCP/UDP connections"; EntryType = "Information" })
         $ProcessIdMap = @{}
-        foreach ($Process in $VipnetProcesses) {
-            $ProcessIdMap[[int]$Process.Id] = $true
-        }
-        netstat -ano 2>$null |
-            ForEach-Object {
-                $Line = $_.Trim()
-                if ($Line -match '^(TCP|UDP)\s+(\S+)\s+(\S+)(?:\s+(\S+))?\s+(\d+)$') {
-                    $Protocol       = $Matches[1]
-                    $LocalAddress   = $Matches[2]
-                    $ForeignAddress = $Matches[3]
-                    $State          = $Matches[4]
-                    $PidFound       = [int]$Matches[5]
-                    if ($ProcessIdMap.ContainsKey($PidFound)) {
-                        New-Object PSObject -Property @{
-                            Protocol       = $Protocol
-                            LocalAddress   = $LocalAddress
-                            ForeignAddress = $ForeignAddress
-                            State          = if ($Protocol -eq 'UDP') {
-                                'N/A'
-                            }
-                            else {
-                                $State
-                            }
-                            OwningProcess  = $PidFound
-                        }
+        foreach ($Process in $VipnetProcesses) { $ProcessIdMap[[int]$Process.Id] = $true }
+        $NetHits = netstat -ano 2>$null | ForEach-Object {
+            $Line = $_.Trim()
+            if ($Line -match '^(TCP|UDP)\s+(\S+)\s+(\S+)(?:\s+(\S+))?\s+(\d+)$') {
+                $PidFound = [int]$Matches[5]
+                if ($ProcessIdMap.ContainsKey($PidFound)) {
+                    New-Object PSObject -Property @{
+                        Protocol       = $Matches[1]
+                        LocalAddress   = $Matches[2]
+                        ForeignAddress = $Matches[3]
+                        State          = if ($Matches[1] -eq 'UDP') { 'N/A' } else { $Matches[4] }
+                        OwningProcess  = $PidFound
                     }
                 }
-            } |
-            Format-List
-    }
-
-    # Seek in file system
-    Write-Log "Seeking for ViPNet in file system"
-    $MaxDepth = 2
-    $Roots = @(
-        "$env:ProgramFiles",
-        "${env:ProgramFiles(x86)}",
-        "$env:ProgramData",
-        "$env:LOCALAPPDATA",
-        "$env:APPDATA"
-    ) | Where-Object { $_ -and (Test-Path $_) }
-    $Roots = $Roots | Where-Object {
-        $_ -and (Test-Path $_ -ErrorAction SilentlyContinue)
-    } | Select-Object -Unique
-
-    $PercentInt = 0
-    $TotalRoots = $Roots.Count
-
-    foreach ($Root in $Roots) {
-        Get-ChildItem $Root `
-            -Directory `
-            -Recurse `
-            -Depth $MaxDepth `
-            -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Name -match $Pattern
-            } |
-            Select-Object FullName,
-                          CreationTime,
-                          LastWriteTime |
-            Format-List
-        $Percent = [math]::Round(($PercentInt / $TotalRoots) * 100)
-        $PercentInt++
-        Write-Host "Scanning status: $Percent"
-    }
-
-    # Firewall scan
-    Write-Log "Seeking for ViPNet in firewall rules"
-    $RuleTect = netsh advfirewall firewall show rule name=all 2>$null
-    $CurrentRule = $null
-
-    foreach ($Line in $RuleText) {
-        if ($Line -match '^(Rule Name|Имя правила)\s*:\s*(.+$') {
-            $CurrentRule = $Matches[2].Trim()
-            if ($CurrentRule -match $Pattern) {
-                New-Object PSObject -Property @{
-                    DisplayName = $CurrentRule
-                }
             }
+        } | Format-List | Out-String -Width 4096
+        if ($NetHits.Trim()) { [void]$Messages.Add(@{ Message = $NetHits; EntryType = "Information" }) }
+    }
+
+    # File system
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in file system"; EntryType = "Information" })
+    $MaxDepth = 2
+    $Roots = @("$env:ProgramFiles", "${env:ProgramFiles(x86)}", "$env:ProgramData", "$env:LOCALAPPDATA", "$env:APPDATA") |
+             Where-Object { $_ -and (Test-Path $_) } | Select-Object -Unique
+
+    $FsHits = foreach ($Root in $Roots) {
+        Get-ChildItem $Root -Directory -Recurse -Depth $MaxDepth -ErrorAction SilentlyContinue |
+            Where-Object { $_.Name -match $Pattern } |
+            Select-Object FullName, CreationTime, LastWriteTime
+    }
+    if ($FsHits) {
+        $FsStr = $FsHits | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $FsStr; EntryType = "Information" })
+    }
+
+    # Firewall  (здесь был баг: $RuleTect vs $RuleText)
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet in firewall rules"; EntryType = "Information" })
+    $RuleText = netsh advfirewall firewall show rule name=all 2>$null
+    $FwHits = foreach ($Line in $RuleText) {
+        if ($Line -match '^(Rule Name|Имя правила)\s*:\s*(.+)$') {
+            $CurrentRule = $Matches[2].Trim()
+            if ($CurrentRule -match $Pattern) { [PSCustomObject]@{ DisplayName = $CurrentRule } }
         }
-    } 
+    }
+    if ($FwHits) {
+        $FwStr = $FwHits | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $FwStr; EntryType = "Information" })
+    }
 
     # Certificates
-    Write-Log "Seeking for ViPNet certificates"
-
-    $CertificateStores = @(
-        'Cert:\LocalMachine\My',
-        'Cert:\CurrentUser\My'
-    )
-
-    foreach ($Store in $CertificateStores) {
-
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet certificates"; EntryType = "Information" })
+    $CertHits = foreach ($Store in @('Cert:\LocalMachine\My','Cert:\CurrentUser\My')) {
         Get-ChildItem $Store -ErrorAction SilentlyContinue |
             Where-Object {
-
                 ($_.Subject -and $_.Subject -match $Pattern) -or
-                ($_.Issuer -and $_.Issuer -match $Pattern) -or
-                ($_.EnhancedKeyUsageList -and
-                    $_.EnhancedKeyUsageList.FriendlyName -match $Pattern)
-
+                ($_.Issuer  -and $_.Issuer  -match $Pattern) -or
+                ($_.EnhancedKeyUsageList -and $_.EnhancedKeyUsageList.FriendlyName -match $Pattern)
             } |
-            Select-Object PSParentPath,
-                          Subject,
-                          Issuer,
-                          Thumbprint,
-                          NotBefore,
-                          NotAfter,
-                          HasPrivateKey,
-                          SerialNumber |
-            Format-List
+            Select-Object PSParentPath, Subject, Issuer, Thumbprint, NotBefore, NotAfter, HasPrivateKey, SerialNumber
+    }
+    if ($CertHits) {
+        $CertStr = $CertHits | Format-List | Out-String -Width 4096
+        [void]$Messages.Add(@{ Message = $CertStr; EntryType = "Information" })
     }
 
     # Crypto providers
-    Write-Log "Seeking for ViPNet cryptographic providers"
-    certutil -csplist 2>$null
-    Write-Log "=== VIPNET SEEKING MODULE FINISHED" "Cyan"
+    [void]$Messages.Add(@{ Message = "Seeking for ViPNet cryptographic providers"; EntryType = "Information" })
+    $Csp = certutil -csplist 2>$null | Out-String -Width 4096
+    if ($Csp.Trim()) { [void]$Messages.Add(@{ Message = $Csp; EntryType = "Information" }) }
+
+    [void]$Messages.Add(@{ Message = "=== VIPNET SEEKING MODULE FINISHED"; EntryType = "Cyan" })
+
+    return [PSCustomObject]@{ Index = $TaskIndex; Messages = $Messages }
 }
 
 # ================================================================================
@@ -1023,18 +967,18 @@ else {
 # OutputIndex — порядок вывода
 # LaunchWeight — приоритет запуска (тяжёлые раньше)
 $TaskBlocks = @(
-    [PSCustomObject]@{ Name='WindowsOfficeCheck'; LaunchWeight=30;  OutputIndex=0;  Block={ param($o) WindowsOfficeCheck -OutputIndex $o } }
-    [PSCustomObject]@{ Name='IpAdressGet';        LaunchWeight=5;   OutputIndex=1;  Block={ param($o) IpAdressGet        -OutputIndex $o } }
-    [PSCustomObject]@{ Name='NetAdapterGet';      LaunchWeight=5;   OutputIndex=2;  Block={ param($o) NetAdapterGet      -OutputIndex $o } }
-    [PSCustomObject]@{ Name='CPUGet';             LaunchWeight=10;  OutputIndex=3;  Block={ param($o) CPUGet             -OutputIndex $o } }
-    [PSCustomObject]@{ Name='VRAMGet';            LaunchWeight=10;  OutputIndex=4;  Block={ param($o) VRAMGet            -OutputIndex $o } }
-    [PSCustomObject]@{ Name='RAMGet';             LaunchWeight=10;  OutputIndex=5;  Block={ param($o) RAMGet             -OutputIndex $o } }
-    [PSCustomObject]@{ Name='DiskGet';            LaunchWeight=70;  OutputIndex=6;  Block={ param($o) DiskGet            -OutputIndex $o } }
-    [PSCustomObject]@{ Name='BIOSGet';            LaunchWeight=90;  OutputIndex=7;  Block={ param($o) BIOSGet            -OutputIndex $o } }  # тяжёлый
-    [PSCustomObject]@{ Name='MonitorGet';         LaunchWeight=15;  OutputIndex=8;  Block={ param($o) MonitorGet         -OutputIndex $o } }
-    [PSCustomObject]@{ Name='PeripheralGet';      LaunchWeight=40;  OutputIndex=9;  Block={ param($o) PeripheralGet      -OutputIndex $o } }
-    [PSCustomObject]@{ Name='SeekObjects';        LaunchWeight=100; OutputIndex=10; Block={ param($o) SeekObjects        -OutputIndex $o } }  # самый тяжёлый
-    [PSCustomObject]@{ Name='ViPNeTSeek';         LaunchWeight=95;  OutputIndex=11; Block={ param($o) ViPNeTSeek         -OutputIndex $o } }  # тяжёлый
+    [PSCustomObject]@{ Name='WindowsOfficeCheck'; LaunchWeight=30;  OutputIndex=0;  Block={ param($o) WindowsOfficeCheck -TaskIndex $o } }
+    [PSCustomObject]@{ Name='IpAdressGet';        LaunchWeight=5;   OutputIndex=1;  Block={ param($o) IpAdressGet        -TaskIndex $o } }
+    [PSCustomObject]@{ Name='NetAdapterGet';      LaunchWeight=5;   OutputIndex=2;  Block={ param($o) NetAdapterGet      -TaskIndex $o } }
+    [PSCustomObject]@{ Name='CPUGet';             LaunchWeight=10;  OutputIndex=3;  Block={ param($o) CPUGet             -TaskIndex $o } }
+    [PSCustomObject]@{ Name='VRAMGet';            LaunchWeight=10;  OutputIndex=4;  Block={ param($o) VRAMGet            -TaskIndex $o } }
+    [PSCustomObject]@{ Name='RAMGet';             LaunchWeight=10;  OutputIndex=5;  Block={ param($o) RAMGet             -TaskIndex $o } }
+    [PSCustomObject]@{ Name='DiskGet';            LaunchWeight=70;  OutputIndex=6;  Block={ param($o) DiskGet            -TaskIndex $o } }
+    [PSCustomObject]@{ Name='BIOSGet';            LaunchWeight=90;  OutputIndex=7;  Block={ param($o) BIOSGet            -TaskIndex $o } }
+    [PSCustomObject]@{ Name='MonitorGet';         LaunchWeight=15;  OutputIndex=8;  Block={ param($o) MonitorGet         -TaskIndex $o } }
+    [PSCustomObject]@{ Name='PeripheralGet';      LaunchWeight=40;  OutputIndex=9;  Block={ param($o) PeripheralGet      -TaskIndex $o } }
+    [PSCustomObject]@{ Name='SeekObjects';        LaunchWeight=100; OutputIndex=10; Block={ param($o) SeekObjects        -TaskIndex $o } }
+    [PSCustomObject]@{ Name='ViPNeTSeek';         LaunchWeight=95;  OutputIndex=11; Block={ param($o) ViPNeTSeek         -TaskIndex $o } }
 )
 
 Write-Log "=== SCAN Start (ThrottleLimit = $([Environment]::ProcessorCount)) ===" "Cyan"
